@@ -1,0 +1,134 @@
+<html>
+<head>
+
+<title>Revision History</title>
+<link rel="stylesheet" href="../boostbook.css" type="text/css">
+<meta name="generator" content="DocBook XSL Stylesheets Vsnapshot">
+<link rel="home" href="../index.html" title="Asio">
+<link rel="up" href="../index.html" title="Asio">
+<link rel="prev" href="std_executors.html" title="Proposed Standard Executors">
+<link rel="next" href="index.html" title="">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body bgcolor="white" text="black" link="#0000FF" vlink="#840084" alink="#0000FF">
+<table cellpadding="2" width="100%"><tr><td valign="top"><img alt="asio C++ library" width="250" height="60" src="../asio.png"></td></tr></table>
+<hr>
+<div class="spirit-nav">
+<a accesskey="p" href="std_executors.html"><img src="../prev.png" alt="Prev"></a><a accesskey="u" href="../index.html"><img src="../up.png" alt="Up"></a><a accesskey="h" href="../index.html"><img src="../home.png" alt="Home"></a><a accesskey="n" href="index.html"><img src="../next.png" alt="Next"></a>
+</div>
+<div class="section">
+<div class="titlepage"><div><div><h2 class="title" style="clear: both">
+<a name="asio.history"></a><a class="link" href="history.html" title="Revision History">Revision History</a>
+</h2></div></div></div>
+<h4>
+<a name="asio.history.h0"></a>
+      <span class="phrase"><a name="asio.history.asio_1_38_2"></a></span><a class="link" href="history.html#asio.history.asio_1_38_2">Asio
+      1.38.2</a>
+    </h4>
+<div class="itemizedlist"><ul class="itemizedlist" style="list-style-type: disc; ">
+<li class="listitem">
+          Added a <code class="computeroutput"><span class="string">"scheduler"</span></code>
+          / <code class="computeroutput"><span class="string">"assume_continuation"</span></code>
+          configuration parameter. When <code class="computeroutput"><span class="keyword">true</span></code>,
+          the scheduler assumes that all posted handlers are a continuation of the
+          currently executing handler, allowing them to be added to a fast thread-local
+          queue. This can improve performance for applications that exclusively use
+          short-running handlers.
+        </li>
+<li class="listitem">
+          Added a <code class="computeroutput"><span class="string">"reactor"</span></code>
+          / <code class="computeroutput"><span class="string">"io_uring_ring_count"</span></code>
+          configuration parameter. This sets the number of independent io_uring instances
+          ("rings") that a single execution context maintains internally.
+          Increasing this parameter from its default of 1 may improve scalability
+          when the execution context is used with multiple threads.
+        </li>
+<li class="listitem">
+          Added a <code class="computeroutput"><span class="string">"reactor"</span></code>
+          / <code class="computeroutput"><span class="string">"io_uring_ring_size"</span></code>
+          configuration parameter, which is used to specify the number of entries
+          in each io_uring instance.
+        </li>
+</ul></div>
+<h4>
+<a name="asio.history.h1"></a>
+      <span class="phrase"><a name="asio.history.asio_1_38_1"></a></span><a class="link" href="history.html#asio.history.asio_1_38_1">Asio
+      1.38.1</a>
+    </h4>
+<div class="itemizedlist"><ul class="itemizedlist" style="list-style-type: disc; ">
+<li class="listitem">
+          Added optional binary versioning using an inline namespace. If the preprocessor
+          macro <code class="computeroutput"><span class="identifier">ASIO_ENABLE_VERSION_NAMESPACE</span></code>
+          is defined, Asio will compile all symbols under an inline namespace that
+          includes the version number. Alternatively, users can specify a custom
+          inline namespace name by defining <code class="computeroutput"><span class="identifier">ASIO_VERSION_NAMESPACE</span></code>
+          directly. This allows different versions of Asio to coexist in the same
+          process without symbol conflicts. The inline namespace is disabled by default
+          to avoid breaking existing code that forward declares Asio names.
+        </li>
+<li class="listitem">
+          Changed the default Windows mutex implementation from <code class="computeroutput"><span class="identifier">CRITICAL_SECTION</span></code>
+          to <code class="computeroutput"><span class="identifier">SRWLOCK</span></code>.
+        </li>
+<li class="listitem">
+          Added a "slim" mutex implementation based on <code class="computeroutput"><span class="identifier">std</span><span class="special">::</span><span class="identifier">atomic</span></code>.
+          When supported by the compiler and OS, this reduces the size of the state
+          required for strands, sockets, and other descriptors.
+        </li>
+<li class="listitem">
+          Added support for compilation under Cygwin64.
+        </li>
+<li class="listitem">
+          Added support for using Cygwin without <code class="computeroutput"><span class="identifier">__USE_W32_SOCKETS</span></code>,
+          allowing the POSIX socket API to be used in place of the Winsock API.
+        </li>
+<li class="listitem">
+          Added the ability for users to override <code class="computeroutput"><span class="identifier">ASIO_DECL</span></code>
+          before including Asio headers. This may be used to override symbol visibility
+          attributes, or to disable the DLL import/export decoration.
+        </li>
+<li class="listitem">
+          Fixed <code class="computeroutput"><span class="identifier">MSG_NOSIGNAL</span></code> handling
+          on NetBSD, which supports the flag regardless of <code class="computeroutput"><span class="identifier">_POSIX_VERSION</span></code>.
+        </li>
+<li class="listitem">
+          Fixed the build with recent Boost versions, which no longer support linking
+          against <code class="computeroutput"><span class="identifier">boost_system</span></code>.
+        </li>
+<li class="listitem">
+          Fixed compatibility with musl libc on older versions of Android.
+        </li>
+<li class="listitem">
+          Fixed detection of <code class="computeroutput"><span class="identifier">std</span><span class="special">::</span><span class="identifier">aligned_alloc</span></code>
+          on older Apple platforms.
+        </li>
+<li class="listitem">
+          Fixed a warning in <code class="computeroutput"><span class="identifier">serial_port_base</span><span class="special">::</span><span class="identifier">character_size</span><span class="special">::</span><span class="identifier">store</span></code>
+          when compiling with MSVC.
+        </li>
+<li class="listitem">
+          Clarified the IPv4 vs IPv6 semantics of <code class="computeroutput"><span class="identifier">ip</span><span class="special">::</span><span class="identifier">multicast</span><span class="special">::</span><span class="identifier">outbound_interface</span></code>
+          in the documentation.
+        </li>
+<li class="listitem">
+          Updated TLS v1.3 context initialisation to correctly detect LibreSSL support
+          (available from LibreSSL 3.2.0).
+        </li>
+<li class="listitem">
+          Fixed compatibility with the latest OpenSSL's <code class="computeroutput"><span class="identifier">X509</span></code>
+          constness changes.
+        </li>
+</ul></div>
+</div>
+<div class="copyright-footer">Copyright © 2003-2026 Christopher
+      M. Kohlhoff<p>
+        Distributed under the Boost Software License, Version 1.0. (See accompanying
+        file LICENSE_1_0.txt or copy at <a href="http://www.boost.org/LICENSE_1_0.txt" target="_top">http://www.boost.org/LICENSE_1_0.txt</a>)
+      </p>
+</div>
+<hr>
+<div class="spirit-nav">
+<a accesskey="p" href="std_executors.html"><img src="../prev.png" alt="Prev"></a><a accesskey="u" href="../index.html"><img src="../up.png" alt="Up"></a><a accesskey="h" href="../index.html"><img src="../home.png" alt="Home"></a><a accesskey="n" href="index.html"><img src="../next.png" alt="Next"></a>
+</div>
+</body>
+</html>
