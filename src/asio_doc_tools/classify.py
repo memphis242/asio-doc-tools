@@ -15,7 +15,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -278,7 +278,9 @@ def _row_to_classification(row: tuple[Any, ...]) -> Classification:
 _QUERY_CHUNK_SIZE: Final = 500
 
 
-def _load_classifications(conn: sqlite3.Connection, keys: Sequence[str]) -> dict[str, Classification]:
+def _load_classifications(
+    conn: sqlite3.Connection, keys: Sequence[str], path: Path
+) -> dict[str, Classification]:
     result: dict[str, Classification] = {}
     unique_keys = list(dict.fromkeys(keys))
     try:
@@ -292,8 +294,14 @@ def _load_classifications(conn: sqlite3.Connection, keys: Sequence[str]) -> dict
             ).fetchall()
             for key, *rest in rows:
                 result[key] = _row_to_classification(tuple(rest))
+    # OperationalError is a subclass of DatabaseError; catch it first for a more specific message.
     except sqlite3.OperationalError as e:
-        raise AsioDocsError(f"could not read the classification store: {e}") from e
+        raise AsioDocsError(f"could not read the classification store at {path}: {e}") from e
+    except sqlite3.DatabaseError as e:
+        raise AsioDocsError(
+            f"the classification store at {path} is corrupt or unreadable ({e}); it holds "
+            "paid-for API results, so fix or remove that file manually before continuing"
+        ) from e
     return result
 
 
@@ -440,46 +448,110 @@ def _diagnose_reply(response: Any, ids: Sequence[str]) -> str:
     return "; ".join(parts) if parts else "one or more reply entries failed schema validation"
 
 
-def _classify_batch(
-    client: Any, batch_keys: Sequence[str], texts: dict[str, str]
-) -> tuple[dict[str, _RawResult], int, int]:
+@dataclass(frozen=True, slots=True)
+class _BatchOutcome:
+    """The result of classifying one top-level batch (recursive splits included).
+
+    `classified` holds whatever was successfully classified and paid for, even when
+    `error` is set - a split whose left half succeeds and right half fails still
+    returns the left half's results, so the caller can upsert what was paid for before
+    raising. `input_tokens`/`output_tokens` cover every response received for this
+    batch, including a max_tokens response that triggered a split and an invalid reply
+    that triggered a retry.
+    """
+
+    classified: dict[str, _RawResult]
+    input_tokens: int
+    output_tokens: int
+    error: AsioDocsError | None = None
+
+
+def _usage_tokens(response: Any) -> tuple[int, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0, 0
+    return usage.input_tokens, usage.output_tokens
+
+
+def _classify_batch(client: Any, batch_keys: Sequence[str], texts: dict[str, str]) -> _BatchOutcome:
+    """Classifies one batch. Never raises AsioDocsError - failures come back as `.error`
+    on the returned outcome, alongside whatever was classified before the failure, so a
+    caller iterating several of these in parallel can store partial, paid-for work.
+    """
     assert batch_keys
     ids = [f"e{i}" for i in range(len(batch_keys))]
     payload = _build_payload(ids, batch_keys, texts)
 
-    response = _send(client, payload)
+    try:
+        response = _send(client, payload)
+    except AsioDocsError as e:
+        return _BatchOutcome({}, 0, 0, e)
+    input_tokens, output_tokens = _usage_tokens(response)
+
     if response.stop_reason == "max_tokens":
         if len(batch_keys) == 1:
-            raise AsioDocsError(
-                "classifying a single entry hit the model's max_tokens limit; entry text: "
-                f"{texts[batch_keys[0]]!r}"
+            return _BatchOutcome(
+                {},
+                input_tokens,
+                output_tokens,
+                AsioDocsError(
+                    "classifying a single entry hit the model's max_tokens limit; entry text: "
+                    f"{texts[batch_keys[0]]!r}"
+                ),
             )
         mid = len(batch_keys) // 2
-        left, left_in, left_out = _classify_batch(client, batch_keys[:mid], texts)
-        right, right_in, right_out = _classify_batch(client, batch_keys[mid:], texts)
-        return {**left, **right}, left_in + right_in, left_out + right_out
+        left = _classify_batch(client, batch_keys[:mid], texts)
+        right = _classify_batch(client, batch_keys[mid:], texts)
+        return _BatchOutcome(
+            {**left.classified, **right.classified},
+            input_tokens + left.input_tokens + right.input_tokens,
+            output_tokens + left.output_tokens + right.output_tokens,
+            left.error or right.error,
+        )
 
-    _check_refusal(response)
+    try:
+        _check_refusal(response)
+    except AsioDocsError as e:
+        return _BatchOutcome({}, input_tokens, output_tokens, e)
+
     parsed = _validate_reply(response, ids)
     if parsed is None:
-        retry_response = _send(client, payload)
+        try:
+            retry_response = _send(client, payload)
+        except AsioDocsError as e:
+            return _BatchOutcome({}, input_tokens, output_tokens, e)
+        retry_in, retry_out = _usage_tokens(retry_response)
+        input_tokens += retry_in
+        output_tokens += retry_out
+
         if retry_response.stop_reason == "max_tokens":
-            raise AsioDocsError(
-                f"the model hit max_tokens retrying a batch of {len(batch_keys)} entries after "
-                "an invalid reply"
+            return _BatchOutcome(
+                {},
+                input_tokens,
+                output_tokens,
+                AsioDocsError(
+                    f"the model hit max_tokens retrying a batch of {len(batch_keys)} entries "
+                    "after an invalid reply"
+                ),
             )
-        _check_refusal(retry_response)
+        try:
+            _check_refusal(retry_response)
+        except AsioDocsError as e:
+            return _BatchOutcome({}, input_tokens, output_tokens, e)
         parsed = _validate_reply(retry_response, ids)
         if parsed is None:
-            raise AsioDocsError(
-                f"the model returned an invalid classification reply twice for a batch of "
-                f"{len(batch_keys)} entries ({_diagnose_reply(retry_response, ids)})"
+            return _BatchOutcome(
+                {},
+                input_tokens,
+                output_tokens,
+                AsioDocsError(
+                    f"the model returned an invalid classification reply twice for a batch of "
+                    f"{len(batch_keys)} entries ({_diagnose_reply(retry_response, ids)})"
+                ),
             )
-        response = retry_response
 
     results = {batch_keys[i]: parsed[ids[i]] for i in range(len(batch_keys))}
-    usage = response.usage
-    return results, usage.input_tokens, usage.output_tokens
+    return _BatchOutcome(results, input_tokens, output_tokens, None)
 
 
 def classify(
@@ -496,8 +568,16 @@ def classify(
     across threads, so the worker threads only call the API; each batch's rows are upserted
     on this (the calling) thread as that batch's future completes, in its own transaction, so
     an interrupted run keeps every batch that finished.
+
+    When a batch fails (refusal, an invalid reply twice, or an API error), batches not yet
+    started are cancelled, batches already in flight are left to finish and their results
+    stored, and the first error raised names how many batches were stored versus cancelled.
+    A KeyboardInterrupt (or any other exception raised out of a future's result rather than
+    returned as `.error`) cancels queued batches, does not wait for in-flight ones, and
+    re-raises immediately; whatever was already upserted stays.
     """
-    conn = _connect(store_path if store_path is not None else default_store_path())
+    resolved_store_path = store_path if store_path is not None else default_store_path()
+    conn = _connect(resolved_store_path)
     try:
         keys = tuple(cache_key(item.entry) for item in items)
         unique_texts: dict[str, str] = {}
@@ -506,7 +586,7 @@ def classify(
             unique_texts.setdefault(key, item.entry.full_text())
             release_by_key.setdefault(key, item.release)
 
-        store = {} if reclassify else _load_classifications(conn, tuple(unique_texts))
+        store = {} if reclassify else _load_classifications(conn, tuple(unique_texts), resolved_store_path)
         pending_keys = list(unique_texts) if reclassify else [k for k in unique_texts if k not in store]
 
         if pending_keys:
@@ -518,29 +598,65 @@ def classify(
 
             client = client_factory()
             total_input = total_output = 0
-            with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(batches))) as pool:
-                futures = [pool.submit(_classify_batch, client, batch, unique_texts) for batch in batches]
+            completed_batches = cancelled_batches = 0
+            first_error: AsioDocsError | None = None
+
+            pool = ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(batches)))
+            futures = [pool.submit(_classify_batch, client, batch, unique_texts) for batch in batches]
+            try:
                 for future in as_completed(futures):
-                    results, input_tokens, output_tokens = future.result()
-                    total_input += input_tokens
-                    total_output += output_tokens
-                    classified_at = time.time()
-                    rows: list[tuple[str, Classification, str]] = []
-                    for key, result in results.items():
-                        classification = Classification(
-                            category=result.category,
-                            breaking=result.breaking,
-                            breaking_reason=result.breaking_reason,
-                            model=MODEL,
-                            effort=EFFORT,
-                            release=str(release_by_key[key]),
-                            classified_at=classified_at,
-                        )
-                        store[key] = classification
-                        rows.append((key, classification, unique_texts[key]))
-                    _upsert_classifications(conn, rows)
+                    try:
+                        outcome = future.result()
+                    except CancelledError:
+                        cancelled_batches += 1
+                        continue
+
+                    completed_batches += 1
+                    total_input += outcome.input_tokens
+                    total_output += outcome.output_tokens
+
+                    if outcome.classified:
+                        classified_at = time.time()
+                        rows: list[tuple[str, Classification, str]] = []
+                        for key, result in outcome.classified.items():
+                            classification = Classification(
+                                category=result.category,
+                                breaking=result.breaking,
+                                breaking_reason=result.breaking_reason,
+                                model=MODEL,
+                                effort=EFFORT,
+                                release=str(release_by_key[key]),
+                                classified_at=classified_at,
+                            )
+                            store[key] = classification
+                            rows.append((key, classification, unique_texts[key]))
+                        _upsert_classifications(conn, rows)
+
+                    if outcome.error is not None and first_error is None:
+                        first_error = outcome.error
+                        # Not-yet-started batches are cancelled; in-flight ones are left to
+                        # finish (cancel() on a running future is a no-op) and stored above
+                        # like any other completed batch as they come in.
+                        for pending in futures:
+                            if not pending.done():
+                                pending.cancel()
+            except BaseException:
+                # A KeyboardInterrupt (or any bug) surfacing out of future.result() rather
+                # than as `.error`: stop taking on new work and do not wait for what is
+                # already running, so the interrupt is not swallowed by a blocking shutdown.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
 
             note(f"classification used {total_input} input tokens and {total_output} output tokens")
+
+            if first_error is not None:
+                raise AsioDocsError(
+                    f"{first_error} ({completed_batches} of {len(batches)} batches completed "
+                    f"and stored what they classified before this error; {cancelled_batches} "
+                    "batches were cancelled before they started)"
+                ) from first_error
 
         return tuple(store[key] for key in keys)
     finally:
