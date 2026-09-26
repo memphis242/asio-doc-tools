@@ -77,11 +77,15 @@ any of them re-classifies automatically.
 
 Spending is hard-capped per run. Before its first request, a run prints how many
 requests it expects, the expected cost, and its hard caps on requests, output
-tokens, and time. It prints actual usage when it finishes, even with `-q`. For
-the full history (about 1,000 bullets) the expected cost is about $0.50 and the
-worst case about $2.50. When a cap is hit, the run stops and keeps everything
-classified so far. Rerunning sends only what is still missing. The first Ctrl-C
-waits for in-flight requests and stores their answers; a second exits at once.
+and input tokens, and time, with the most it can possibly cost. It prints actual
+usage when it finishes, even with `-q`. For the full history (about 1,000
+bullets) the expected cost is about $0.55 and the worst case $3.88; a run whose
+worst case would pass $5.00 is refused before anything is sent (diff a smaller
+range first: its answers carry over). Nothing is sent either when the
+classification store cannot be written. When a cap is hit, the run stops and
+keeps everything classified so far. Rerunning sends only what is still missing.
+The first Ctrl-C waits for in-flight requests and stores their answers; a second
+exits at once, and so does a run still waiting after about 9 minutes.
 
 ## Files
 
@@ -89,6 +93,7 @@ waits for in-flight requests and stores their answers; a second exits at once.
 |---|---|
 | `~/.cache/asio-doc-tools/` | HTTP cache, release tarballs, extracted doc trees, parsed revision history (safe to delete) |
 | `~/.local/share/asio-doc-tools/classifications.sqlite3` | Stored classifications, one row per bullet with its text (paid for; keep it). Query it with `sqlite3` |
+| `~/.local/share/asio-doc-tools/classifications.pending.jsonl` | Answers a run paid for but could not write to the store (a full disk, say), one JSON object per line; the next run moves them into the store. Normally absent |
 | `~/.local/share/asio-doc-tools/installed-man-pages.json` | Install manifest |
 
 XDG base directory variables (`XDG_CACHE_HOME`, `XDG_DATA_HOME`) are honored.
