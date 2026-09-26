@@ -1,9 +1,11 @@
+import inspect
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from asio_doc_tools import classify, notesdiff
+from asio_doc_tools import classify, cli, notesdiff
 from asio_doc_tools.diag import AsioDocsError
 from asio_doc_tools.history import Entry, Release
 from asio_doc_tools.versions import Version
@@ -77,6 +79,45 @@ def test_unknown_version_names_nearest_known_versions(monkeypatch) -> None:
     _fake_fetch_history(monkeypatch)
     with pytest.raises(AsioDocsError, match=r"1\.30\.2.*1\.38\.0|1\.38\.0.*1\.30\.2"):
         notesdiff.resolve_range("1.38.0", "1.35.0")
+
+
+def test_reclassify_is_gone() -> None:
+    # Stored results are keyed by prompt version, model, and effort, so there is nothing
+    # left for a "classify again" option to do but pay again for identical requests.
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["diff", "1.38.0", "1.38.2", "--reclassify"])
+    assert "reclassify" not in inspect.signature(notesdiff.build_diff_result).parameters
+    assert "reclassify" not in inspect.signature(classify.classify).parameters
+
+
+def test_build_diff_result_classifies_only_entries_not_yet_stored(monkeypatch, tmp_path) -> None:
+    _fake_fetch_history(monkeypatch)
+    store_path = tmp_path / "classifications.sqlite3"
+    calls: list[dict] = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        ids = [item["id"] for item in json.loads(kwargs["messages"][0]["content"])["items"]]
+        items = [{"id": i, "category": "fixed", "breaking": False, "breaking_reason": ""} for i in ids]
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=json.dumps({"items": items}))],
+            usage=SimpleNamespace(input_tokens=100, output_tokens=10),
+            stop_details=None,
+        )
+
+    client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    first = notesdiff.build_diff_result(
+        "1.38.1", "1.38.2", client_factory=lambda: client, store_path=store_path
+    )
+    assert first.entry_count == 2
+    assert len(calls) == 1
+    wider = notesdiff.build_diff_result(
+        "1.38.0", "1.38.2", client_factory=lambda: client, store_path=store_path
+    )
+    assert wider.entry_count == 3
+    assert len(calls) == 2
+    assert len(json.loads(calls[1]["messages"][0]["content"])["items"]) == 1  # only the new entry
 
 
 # ---------------------------------------------------------------------------

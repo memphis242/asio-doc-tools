@@ -2,8 +2,8 @@
 
 Every failure the user can act on is raised as AsioDocsError with a message that
 says what went wrong and what to do about it; the CLI prints it and exits
-non-zero. Progress notes and warnings go to stderr so stdout stays clean for
-the actual output (a diff, a page listing).
+non-zero. Progress notes, API spend reports, and warnings go to stderr so stdout
+stays clean for the actual output (a diff, a page listing).
 """
 
 import sys
@@ -25,6 +25,12 @@ def note(message: str) -> None:
     """Progress information; suppressed by --quiet."""
     if not _quiet:
         print(f"{_PROG}: {message}", file=sys.stderr, flush=True)
+
+
+def spend(message: str) -> None:
+    """Paid API usage: what a command is about to spend and what it spent. Never
+    suppressed, not even by --quiet, since it is the only record of a paid run."""
+    print(f"{_PROG}: {message}", file=sys.stderr, flush=True)
 
 
 def warn(message: str) -> None:

@@ -14,12 +14,7 @@ _RENDERERS: dict[str, Callable[[notesdiff.DiffResult, argparse.Namespace], str]]
 
 
 def _run_diff(args: argparse.Namespace) -> int:
-    result = notesdiff.build_diff_result(
-        args.from_version,
-        args.to_version,
-        refresh=args.refresh,
-        reclassify=args.reclassify,
-    )
+    result = notesdiff.build_diff_result(args.from_version, args.to_version, refresh=args.refresh)
     print(_RENDERERS[args.format](result, args))
     return 0
 
@@ -38,16 +33,18 @@ def register(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
     diff_parser = commands.add_parser(
         "diff",
         help="show what changed between two Asio releases",
-        description=f"Classification uses {classify.MODEL} at {classify.EFFORT} effort.",
+        description=(
+            f"Classification uses {classify.MODEL} at {classify.EFFORT} effort. Each entry is sent "
+            "once and its result stored, so only unclassified entries cost anything. A run that "
+            "sends requests first prints what it expects to spend and its hard caps, and "
+            "afterwards what it used, even with --quiet."
+        ),
     )
     diff_parser.add_argument("from_version", metavar="FROM", help="a version, or 'latest'")
     diff_parser.add_argument("to_version", metavar="TO", help="a version, or 'latest'")
     diff_parser.add_argument("--format", choices=tuple(_RENDERERS), default="text")
     diff_parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     diff_parser.add_argument("--refresh", action="store_true", help="re-fetch the revision history page")
-    diff_parser.add_argument(
-        "--reclassify", action="store_true", help="ignore stored classifications for entries in range"
-    )
     diff_parser.set_defaults(run=_run_diff)
 
     releases_parser = commands.add_parser("releases", help="list Asio releases and their notes entry counts")

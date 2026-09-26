@@ -72,7 +72,16 @@ classified by Claude (Claude Sonnet 5, low effort) through the Anthropic API.
 Credentials resolve like any Anthropic SDK client: `ANTHROPIC_API_KEY`, or an
 `ant auth login` profile. Every answer is stored permanently per bullet, so a
 bullet is only ever sent once: repeated diffs are instant, free, and stable.
-`--reclassify` re-asks for the bullets in the requested range.
+Stored answers are keyed by prompt version, model, and effort, so a change to
+any of them re-classifies automatically.
+
+Spending is hard-capped per run. Before its first request, a run prints how many
+requests it expects, the expected cost, and its hard caps on requests, output
+tokens, and time. It prints actual usage when it finishes, even with `-q`. For
+the full history (about 1,000 bullets) the expected cost is about $0.50 and the
+worst case about $2.50. When a cap is hit, the run stops and keeps everything
+classified so far. Rerunning sends only what is still missing. The first Ctrl-C
+waits for in-flight requests and stores their answers; a second exits at once.
 
 ## Files
 

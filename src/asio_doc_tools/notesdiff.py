@@ -145,14 +145,11 @@ def build_diff_result(
     client_factory: classify.ClientFactory = classify.default_client_factory,
     store_path: Path | None = None,
     refresh: bool = False,
-    reclassify: bool = False,
 ) -> DiffResult:
     older, newer, selected = resolve_range(from_spec, to_spec, refresh=refresh)
     items = tuple(classify.ClassifyItem(release=release.version, entry=entry)
                   for release in selected for entry in release.entries)
-    classifications = classify.classify(
-        items, client_factory=client_factory, store_path=store_path, reclassify=reclassify
-    )
+    classifications = classify.classify(items, client_factory=client_factory, store_path=store_path)
     return DiffResult(
         from_version=older,
         to_version=newer,
