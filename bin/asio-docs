@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Launcher that runs asio_doc_tools from the checkout this file lives in.
+
+Symlink it anywhere on PATH (e.g. ~/.local/bin/asio-docs); the symlink is
+resolved so the package always comes from this checkout's src/ directory.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from asio_doc_tools.cli import main  # noqa: E402
+
+raise SystemExit(main())

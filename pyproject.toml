@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asio-doc-tools"
+version = "0.1.0"
+description = "Local man pages and release-notes diffing for the standalone Asio C++ library"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "lxml>=5",
+    "anthropic>=0.100",
+]
+
+[project.scripts]
+asio-docs = "asio_doc_tools.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
