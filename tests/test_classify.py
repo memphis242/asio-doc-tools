@@ -3,6 +3,8 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -871,7 +873,7 @@ def test_a_worker_interrupt_does_not_wait_for_queued_batches(tmp_path, monkeypat
     monkeypatch.setattr(classify, "_MAX_WORKERS", 1)
     store_path = _store_path(tmp_path)
     items = _items(4)
-    block_delay = 0.3
+    block_delay = 2.0  # never spent: those batches are never sent (asserted below)
     responses = [
         _text_response([_good_item("e0")]),  # batch 0: succeeds and is stored
         _raising(KeyboardInterrupt()),  # batch 1: interrupted
@@ -1677,3 +1679,63 @@ def test_usage_over_a_reservation_stops_the_run_and_keeps_the_result(tmp_path, m
     assert len(client.calls) == 1  # the second batch was never sent
     assert classify.stored_keys(store_path) == {classify.cache_key(items[0].entry)}
     assert "1 of 2 entries" in str(excinfo.value)
+
+
+def _dead_pid() -> int:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()  # exited and reaped: no process has this pid (until it is reused)
+    return child.pid
+
+
+def test_files_of_a_dead_process_are_taken_over_at_once_but_not_those_of_a_live_one(tmp_path) -> None:
+    store_path = _store_path(tmp_path)
+    directory = classify._pending_dir(store_path)
+    directory.mkdir()
+    now_ns = time.time_ns()
+    dead, live, own = _dead_pid(), os.getppid(), os.getpid()
+
+    def named(prefix: str, pid: int, ns: int = now_ns) -> str:
+        return f"{prefix}{ns}-{pid}-{os.urandom(16).hex()}"
+
+    dead_claim = directory / f"{named('.claimed-', dead)}-{classify._unique_pending_name()}"
+    dead_claim.write_text(classify._pending_lines(_rows(1)))
+    dead_temporary = directory / f"{named('.tmp-', dead)}.jsonl"
+    dead_temporary.write_text(classify._pending_lines(_rows(1, start=1)))
+    live_claim = directory / f"{named('.claimed-', live)}-{classify._unique_pending_name()}"
+    live_claim.write_text(classify._pending_lines(_rows(1, start=2)))
+    old_own_claim = directory / (
+        f"{named('.claimed-', own, now_ns - 2 * classify._PENDING_ORPHAN_AGE_NS)}-{classify._unique_pending_name()}"
+    )
+    old_own_claim.write_text(classify._pending_lines(_rows(1, start=3)))
+
+    _import(store_path)
+
+    assert classify.stored_keys(store_path) == {_rows(1)[0].key, _rows(1, start=1)[0].key}
+    assert _files(directory) == sorted([live_claim.name, old_own_claim.name])
+
+
+def test_orphan_rules_for_unusual_pids() -> None:
+    now_ns = time.time_ns()
+    old_ns = now_ns - 2 * classify._PENDING_ORPHAN_AGE_NS
+    assert not classify._orphaned(old_ns, os.getpid(), now_ns)  # never this process's own
+    assert not classify._orphaned(now_ns, 0, now_ns)  # pid 0 is never signalled
+    assert classify._orphaned(old_ns, 0, now_ns)  # but the age rule still applies
+    assert not classify._orphaned(now_ns, 9_999_999_999, now_ns)  # out of range: age rule
+    assert classify._orphaned(now_ns, _dead_pid(), now_ns)
+
+
+def test_classify_must_run_on_the_main_thread(tmp_path) -> None:
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            classify.classify(
+                [_item("x")], client_factory=lambda: FakeClient([]), store_path=_store_path(tmp_path)
+            )
+        except BaseException as e:
+            raised.append(e)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    assert len(raised) == 1 and isinstance(raised[0], AssertionError)

@@ -470,8 +470,9 @@ def _check_store_writable(conn: sqlite3.Connection, path: Path) -> None:
 # to this process (".claimed-<time>-<pid>-<uuid>-<name>"), imports it in one
 # transaction, and deletes it; a failed import renames it back. So two runs never import
 # or delete one file twice, and a file whose import fails stays for a later run.
-# Files left by a process that died (a temporary or claimed file over an hour old) are
-# imported too, a temporary one without its torn last line, if any.
+# Files left by a process that died (a temporary or claimed file whose pid no longer
+# exists, or, when that cannot be told, over an hour old) are imported too, a temporary
+# one without its torn last line, if any.
 #
 # Every line of a file is validated as strictly as a reply. An invalid line stops the run
 # with an error naming the file and the line, and the file is kept for the user.
@@ -501,13 +502,14 @@ _PENDING_STRING_FIELDS: Final = (
     "text",
 )
 # <time in ns>-<pid>-<uuid>.jsonl; temporary and claimed files add a prefix to it.
-_PENDING_NAME_RE: Final = re.compile(r"(?P<ns>[0-9]{1,20})-[0-9]{1,10}-[0-9a-f]{32}\.jsonl")
+_PENDING_NAME_RE: Final = re.compile(r"(?P<ns>[0-9]{1,20})-(?P<pid>[0-9]{1,10})-[0-9a-f]{32}\.jsonl")
 _PENDING_TEMP_PREFIX: Final = ".tmp-"
 _PENDING_CLAIMED_RE: Final = re.compile(
-    r"\.claimed-(?P<ns>[0-9]{1,20})-[0-9]{1,10}-[0-9a-f]{32}-(?P<inner>.+)"
+    r"\.claimed-(?P<ns>[0-9]{1,20})-(?P<pid>[0-9]{1,10})-[0-9a-f]{32}-(?P<inner>.+)"
 )
-# A temporary or claimed file this old belongs to a process that died: writing or
-# importing one file takes well under a second.
+# A temporary or claimed file this old belongs to a process that died, even when its pid
+# is in use (by another process, since pids are reused): writing or importing one file
+# takes well under a second.
 _PENDING_ORPHAN_AGE_NS: Final = 3_600 * 1_000_000_000
 
 
@@ -678,13 +680,34 @@ def _pending_candidates(directory: Path, now_ns: int) -> tuple[tuple[str, str], 
         if _PENDING_NAME_RE.fullmatch(name):
             candidates.append((name, name))
         elif name.startswith(_PENDING_TEMP_PREFIX):
-            match = _PENDING_NAME_RE.fullmatch(name.removeprefix(_PENDING_TEMP_PREFIX))
-            if match is not None and now_ns - int(match["ns"]) > _PENDING_ORPHAN_AGE_NS:
+            temporary = _PENDING_NAME_RE.fullmatch(name.removeprefix(_PENDING_TEMP_PREFIX))
+            if temporary is not None and _orphaned(int(temporary["ns"]), int(temporary["pid"]), now_ns):
                 candidates.append((name, name))
         elif (claimed := _PENDING_CLAIMED_RE.fullmatch(name)) is not None:
-            if now_ns - int(claimed["ns"]) > _PENDING_ORPHAN_AGE_NS:
+            if _orphaned(int(claimed["ns"]), int(claimed["pid"]), now_ns):
                 candidates.append((name, claimed["inner"]))
     return tuple(candidates)
+
+
+def _orphaned(written_ns: int, pid: int, now_ns: int) -> bool:
+    """Whether the process that named a temporary or claimed file `pid` at `written_ns` is
+    gone, so an import may take the file over.
+
+    Never for this process's own files. At once when no process has that pid; otherwise
+    (the pid is alive, possibly reused, or cannot be checked) once the file is over an
+    hour old.
+    """
+    if pid == os.getpid():
+        return False
+    # pid 0 would signal this process's group; os.kill(pid, 0) ends a process on Windows.
+    if pid > 0 and os.name == "posix":
+        try:
+            os.kill(pid, 0)  # signal 0 checks that the process exists and sends nothing
+        except ProcessLookupError:
+            return True
+        except (OSError, OverflowError):
+            pass  # alive but not ours to signal (PermissionError), or an out-of-range pid
+    return now_ns - written_ns > _PENDING_ORPHAN_AGE_NS
 
 
 def _import_pending_file(conn: sqlite3.Connection, store_path: Path, name: str, unclaimed: str) -> int | None:
@@ -2047,7 +2070,12 @@ def classify(
     first Ctrl-C waits for the requests in flight and stores their results, then
     re-raises KeyboardInterrupt; a second one exits the process at once (status 130), as
     does the wall-clock watchdog (status 1).
+
+    Must be called from the main thread: abandoning a run replaces the SIGINT handler,
+    which only the main thread can do, and without that the watchdog's exit is not
+    guaranteed.
     """
+    assert threading.current_thread() is threading.main_thread()
     resolved_store_path = store_path if store_path is not None else default_store_path()
     conn = _connect(resolved_store_path)
     try:
