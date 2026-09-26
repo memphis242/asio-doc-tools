@@ -7,6 +7,7 @@ stale copy is used with a warning, so the tools keep working offline.
 """
 
 import hashlib
+import http.client
 import json
 import os
 import tempfile
@@ -53,7 +54,10 @@ def fetch(
             if e.code not in _RETRYABLE_HTTP_STATUS:
                 raise FetchError(f"GET {url} failed: HTTP {e.code} {e.reason}") from e
             last_failure = f"HTTP {e.code} {e.reason}"
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
+            # http.client.HTTPException covers a connection that drops mid-response
+            # (IncompleteRead and friends), which response.read() raises directly
+            # rather than wrapping in a URLError.
             last_failure = str(getattr(e, "reason", e))
         else:
             rejection = validate(body) if validate is not None else None
@@ -73,12 +77,21 @@ def _cache_file(url: str) -> Path:
     return paths.cache_dir() / "http" / digest[:2] / digest
 
 
-def atomic_write(path: Path, data: bytes) -> None:
-    """Write via a temp file + rename so readers never see a partial file."""
+def atomic_write(path: Path, data: bytes, *, mode: int | None = None) -> None:
+    """Write via a temp file + rename so readers never see a partial file.
+
+    `mode` overrides the permissions `mkstemp` gives the temp file (0o600, so
+    normally owner-only); pass e.g. 0o644 for output meant to be world-readable,
+    such as an installed man page. `fd` is handed to `os.fdopen` immediately, so
+    the `with` block's own close covers every exit path (including the chmod or
+    the write raising) and no descriptor can survive past this call.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "wb") as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             f.write(data)
         os.replace(tmp_name, path)
     except BaseException:

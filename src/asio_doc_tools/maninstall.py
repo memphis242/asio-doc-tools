@@ -2,33 +2,48 @@
 
 `write_tree` is the primitive both `install` and `asio-docs man build` use: it
 just writes pages under a directory. `install` additionally tracks what it put
-where (the manifest at `paths.data_dir()/installed-man-pages.json`), so a later
-install or uninstall knows which files are safe to remove and which belong to
-someone else, and refreshes `mandb`'s user index so `man`/`apropos` see the
-result.
+where, so a later install or uninstall knows which files are safe to remove and
+which belong to someone else, and refreshes `mandb`'s user index so `man` and
+`apropos` see the result.
+
+The manifest at `paths.data_dir()/installed-man-pages.json` holds one record per
+man directory a caller has installed into, keyed by that directory's canonical
+(expanded and symlink-resolved) absolute path, so installing into two different
+directories are simply two independent records rather than one replacing the
+other. Callers are expected to pass an already-canonical `man_dir` (the CLI
+resolves `--man-dir`/`--out` once, at the argument-parsing boundary); every
+function here re-resolves it anyway, both so direct callers such as tests get
+the same one-record-per-real-directory behavior and so a record is always
+looked up and stored under the same key regardless of how the path was spelled.
 """
 
 import gzip
 import json
+import re
 import shutil
 import subprocess
-import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from . import paths
+from . import net, paths
 from .diag import AsioDocsError, warn
 from .manpage import ManPage
 from .versions import Version
 
 _MANIFEST_NAME: Final = "installed-man-pages.json"
+_INSTALLED_PATH_RE: Final = re.compile(r"^man[0-9]+/asio[^/]*(?:\.gz)?$")
+_INSTALLED_FILE_MODE: Final = 0o644
 
 
 def _manifest_path() -> Path:
     return paths.data_dir() / _MANIFEST_NAME
+
+
+def _canonical(man_dir: Path) -> Path:
+    return man_dir.expanduser().resolve()
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,18 +56,6 @@ class InstallReport:
     warnings: tuple[str, ...]
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    tmp_path = Path(tmp_name)
-    try:
-        tmp_path.write_bytes(data)
-        tmp_path.replace(path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
 def write_tree(pages: Sequence[ManPage], root: Path, *, compress: bool = True) -> tuple[Path, ...]:
     """Writes each page under root/<subdir>/<filename>[.gz]; returns the written paths."""
     filenames = [page.filename for page in pages]
@@ -62,7 +65,7 @@ def write_tree(pages: Sequence[ManPage], root: Path, *, compress: bool = True) -
         relative = Path(page.subdir) / (page.filename + (".gz" if compress else ""))
         destination = root / relative
         body = gzip.compress(page.source.encode(), mtime=0) if compress else page.source.encode()
-        _atomic_write_bytes(destination, body)
+        net.atomic_write(destination, body, mode=_INSTALLED_FILE_MODE)
         written.append(destination)
     return tuple(written)
 
@@ -74,46 +77,65 @@ def _relative_paths(pages: Sequence[ManPage], *, compress: bool) -> tuple[str, .
 
 
 @dataclass(frozen=True, slots=True)
-class _Manifest:
-    man_dir: str
-    version: str
+class _Record:
+    version: Version
     installed_at: float
     paths: tuple[str, ...]
 
     def to_json(self) -> dict[str, object]:
-        return {
-            "man_dir": self.man_dir,
-            "version": self.version,
-            "installed_at": self.installed_at,
-            "paths": list(self.paths),
-        }
-
-    @classmethod
-    def from_json(cls, data: dict[str, object]) -> "_Manifest":
-        return cls(
-            man_dir=str(data["man_dir"]),
-            version=str(data["version"]),
-            installed_at=float(data["installed_at"]),  # type: ignore[arg-type]
-            paths=tuple(str(p) for p in data["paths"]),  # type: ignore[union-attr]
-        )
+        return {"version": str(self.version), "installed_at": self.installed_at, "paths": list(self.paths)}
 
 
-def _load_manifest() -> _Manifest | None:
+def _invalid(manifest_path: Path, reason: str) -> AsioDocsError:
+    return AsioDocsError(f"{manifest_path} is not a valid install manifest ({reason}); remove it and reinstall.")
+
+
+def _validate_paths(paths_field: object, *, manifest_path: Path, man_dir: str) -> tuple[str, ...]:
+    if not isinstance(paths_field, list) or not all(isinstance(p, str) for p in paths_field):
+        raise _invalid(manifest_path, f"'{man_dir}'.paths must be a list of strings")
+    for relative in paths_field:
+        if not _INSTALLED_PATH_RE.match(relative):
+            raise _invalid(manifest_path, f"'{man_dir}' lists an unexpected installed path {relative!r}")
+    return tuple(paths_field)
+
+
+def _record_from_json(data: object, *, manifest_path: Path, man_dir: str) -> _Record:
+    if not isinstance(data, dict):
+        raise _invalid(manifest_path, f"the record for '{man_dir}' is not an object")
+    try:
+        version = Version.parse(str(data["version"]))
+        installed_at = float(data["installed_at"])  # type: ignore[arg-type]
+    except KeyError as e:
+        raise _invalid(manifest_path, f"'{man_dir}' is missing field {e}") from e
+    except (TypeError, ValueError) as e:
+        raise _invalid(manifest_path, f"'{man_dir}' has an invalid version or timestamp ({e})") from e
+    paths_field = _validate_paths(data.get("paths"), manifest_path=manifest_path, man_dir=man_dir)
+    return _Record(version=version, installed_at=installed_at, paths=paths_field)
+
+
+def _load_manifest() -> dict[str, _Record]:
+    """Every recorded install, keyed by canonical man_dir. Empty if none is recorded."""
     manifest_path = _manifest_path()
     if not manifest_path.is_file():
-        return None
+        return {}
     try:
-        return _Manifest.from_json(json.loads(manifest_path.read_text()))
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-        raise AsioDocsError(
-            f"{manifest_path} is not a valid install manifest ({e}); remove it and reinstall."
-        ) from e
+        raw = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as e:
+        raise _invalid(manifest_path, str(e)) from e
+    if not isinstance(raw, dict):
+        raise _invalid(manifest_path, "the top level must be an object of man_dir -> record")
+    records: dict[str, _Record] = {}
+    for man_dir, data in raw.items():
+        if not isinstance(man_dir, str) or not Path(man_dir).is_absolute():
+            raise _invalid(manifest_path, f"key {man_dir!r} is not an absolute man_dir path")
+        records[man_dir] = _record_from_json(data, manifest_path=manifest_path, man_dir=man_dir)
+    return records
 
 
-def _save_manifest(manifest: _Manifest) -> None:
+def _save_manifest(records: dict[str, _Record]) -> None:
     manifest_path = _manifest_path()
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_bytes(manifest_path, json.dumps(manifest.to_json(), indent=2).encode())
+    body = json.dumps({man_dir: record.to_json() for man_dir, record in records.items()}, indent=2).encode()
+    net.atomic_write(manifest_path, body)
 
 
 def _run_mandb(man_dir: Path) -> str | None:
@@ -138,28 +160,35 @@ def _effective_manpath() -> tuple[Path, ...]:
     result = subprocess.run(["manpath"], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         return ()
-    return tuple(Path(p) for p in result.stdout.strip().split(":") if p)
+    return tuple(Path(p).expanduser().resolve() for p in result.stdout.strip().split(":") if p)
+
+
+def _remove_listed(man_dir: Path, relative_paths: Sequence[str]) -> int:
+    removed = 0
+    for relative in relative_paths:
+        candidate = man_dir / relative
+        # `relative` was already checked by _validate_paths (or, for a record built
+        # in this call, is one of our own filenames); this is the last-resort check
+        # on that invariant before anything is unlinked.
+        assert candidate.resolve().is_relative_to(man_dir), candidate
+        if candidate.is_file():
+            candidate.unlink()
+            removed += 1
+    return removed
 
 
 def install(
     pages: Sequence[ManPage], man_dir: Path, *, version: Version, force: bool = False
 ) -> InstallReport:
-    previous = _load_manifest()
+    man_dir = _canonical(man_dir)
+    key = str(man_dir)
+    records = _load_manifest()
+    previous = records.get(key)
+    previously_known = set(previous.paths) if previous is not None else set()
     warnings: list[str] = []
 
     new_relative = _relative_paths(pages, compress=True)
-    if previous is not None and Path(previous.man_dir) == man_dir:
-        stale = set(previous.paths) - set(new_relative)
-        previously_known = set(previous.paths)
-    else:
-        stale = set()
-        previously_known = set()
-        if previous is not None:
-            warnings.append(
-                f"a previous install at {previous.man_dir} is unrelated to {man_dir}; "
-                f"its files are left alone (run 'asio-docs man uninstall --man-dir {previous.man_dir}' "
-                "to remove them)."
-            )
+    stale = previously_known - set(new_relative)
 
     if not force:
         conflicts = [
@@ -172,27 +201,25 @@ def install(
             more = f" (and {len(conflicts) - 5} more)" if len(conflicts) > 5 else ""
             raise AsioDocsError(
                 f"{len(conflicts)} target file(s) already exist and were not installed by "
-                f"asio-doc-tools: {sample}{more}. Use --force to overwrite them."
+                f"asio-doc-tools: {sample}{more}. Use --force to overwrite them (they will then be "
+                "tracked as this tool's own pages going forward)."
             )
+
+    # Record intent before writing anything: the union of what was there before and
+    # what is about to be written. If the process is interrupted after this point,
+    # every file on disk that could plausibly need cleaning up is still listed by
+    # some record, so a later install or uninstall never loses track of a page.
+    intent_paths = tuple(sorted(previously_known | set(new_relative)))
+    records[key] = _Record(version=version, installed_at=time.time(), paths=intent_paths)
+    _save_manifest(records)
 
     written = write_tree(pages, man_dir, compress=True)
     assert len(written) == len(new_relative)
 
-    removed = 0
-    for relative in sorted(stale):
-        stale_path = man_dir / relative
-        if stale_path.is_file():
-            stale_path.unlink()
-            removed += 1
+    removed = _remove_listed(man_dir, sorted(stale))
 
-    _save_manifest(
-        _Manifest(
-            man_dir=str(man_dir),
-            version=str(version),
-            installed_at=time.time(),
-            paths=tuple(sorted(new_relative)),
-        )
-    )
+    records[key] = _Record(version=version, installed_at=time.time(), paths=tuple(sorted(new_relative)))
+    _save_manifest(records)
 
     mandb_warning = _run_mandb(man_dir)
     if mandb_warning is not None:
@@ -221,28 +248,31 @@ def install(
 
 
 def uninstall(man_dir: Path | None) -> int:
-    """Removes installed pages and the manifest; returns the count removed."""
-    previous = _load_manifest()
-    if previous is None:
+    """Removes one recorded install's pages and its manifest record; returns the count removed."""
+    records = _load_manifest()
+    if man_dir is not None:
+        man_dir = _canonical(man_dir)
+        key = str(man_dir)
+        if key not in records:
+            known = ", ".join(sorted(records)) if records else "none"
+            raise AsioDocsError(f"no asio-doc-tools man pages are recorded as installed in {man_dir} "
+                                 f"(recorded install(s): {known}).")
+    elif not records:
         raise AsioDocsError("no asio-doc-tools man pages are recorded as installed.")
-    target_dir = man_dir if man_dir is not None else Path(previous.man_dir)
-
-    removed = 0
-    if target_dir == Path(previous.man_dir):
-        for relative in previous.paths:
-            candidate = target_dir / relative
-            if candidate.is_file():
-                candidate.unlink()
-                removed += 1
-    else:
-        warn(
-            f"the install manifest points at {previous.man_dir}, not {target_dir}; "
-            "nothing was removed there. Run uninstall without --man-dir to remove the recorded install."
+    elif len(records) > 1:
+        raise AsioDocsError(
+            f"pages are installed in more than one man dir ({', '.join(sorted(records))}); "
+            "pass --man-dir to say which one."
         )
+    else:
+        key = next(iter(records))
+        man_dir = Path(key)
 
-    _manifest_path().unlink(missing_ok=True)
+    removed = _remove_listed(man_dir, records[key].paths)
+    del records[key]
+    _save_manifest(records)
 
-    mandb_warning = _run_mandb(target_dir)
+    mandb_warning = _run_mandb(man_dir)
     if mandb_warning is not None:
         warn(mandb_warning)
 
@@ -251,25 +281,27 @@ def uninstall(man_dir: Path | None) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Status:
-    installed: bool
-    man_dir: Path | None
-    version: Version | None
-    installed_at: float | None
+    man_dir: Path
+    version: Version
+    installed_at: float
     count_by_section: tuple[tuple[str, int], ...]
 
 
-def status() -> Status:
-    manifest = _load_manifest()
-    if manifest is None:
-        return Status(installed=False, man_dir=None, version=None, installed_at=None, count_by_section=())
-    counts: dict[str, int] = {}
-    for relative in manifest.paths:
-        section = Path(relative).parent.name
-        counts[section] = counts.get(section, 0) + 1
-    return Status(
-        installed=True,
-        man_dir=Path(manifest.man_dir),
-        version=Version.parse(manifest.version),
-        installed_at=manifest.installed_at,
-        count_by_section=tuple(sorted(counts.items())),
-    )
+def status() -> tuple[Status, ...]:
+    """Every recorded install, oldest man_dir spelling first."""
+    records = _load_manifest()
+    result: list[Status] = []
+    for man_dir, record in sorted(records.items()):
+        counts: dict[str, int] = {}
+        for relative in record.paths:
+            section = Path(relative).parent.name
+            counts[section] = counts.get(section, 0) + 1
+        result.append(
+            Status(
+                man_dir=Path(man_dir),
+                version=record.version,
+                installed_at=record.installed_at,
+                count_by_section=tuple(sorted(counts.items())),
+            )
+        )
+    return tuple(result)

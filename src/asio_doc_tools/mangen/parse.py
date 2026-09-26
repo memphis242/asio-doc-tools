@@ -19,6 +19,7 @@ import lxml.html
 from lxml.html import HtmlElement
 
 from ..diag import AsioDocsError
+from ..links import external_url, is_bare_external_host
 from . import ir
 
 _PARSER: Final = lxml.html.HTMLParser(encoding="utf-8")
@@ -58,9 +59,15 @@ class _Converter:
 
     def resolve_href(self, href: str) -> tuple[str, str] | str:
         """(doc-relative path, fragment) for links into the tree, or an absolute URL."""
-        parts = urlsplit(href.strip())
+        stripped = href.strip()
+        if is_bare_external_host(stripped):
+            # e.g. asio/history.html citing a standards paper as "www.open-std.org/..."
+            # (sometimes with a leading "../") with no scheme: an external link, not
+            # an in-tree path missing its "http://".
+            return external_url(stripped)
+        parts = urlsplit(stripped)
         if parts.scheme:
-            return href.strip()
+            return stripped
         if not parts.path:
             return self._base_rel, parts.fragment
         joined = posixpath.join(posixpath.dirname(self._base_rel), unquote(parts.path))

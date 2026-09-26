@@ -13,6 +13,17 @@ from .versions import Version, resolve
 _SOURCE_CHOICES: tuple[Source, ...] = ("auto", "tarball", "online")
 
 
+def _resolve_dir(path: Path) -> Path:
+    """Canonicalizes a directory argument once, at the CLI boundary.
+
+    Everything downstream (the install manifest's keys, the manpath comparison,
+    the files `build` writes) works from this same expanded, symlink-resolved,
+    absolute form, so e.g. installing with a relative `--man-dir` and later
+    uninstalling from a different working directory still finds the same record.
+    """
+    return path.expanduser().resolve()
+
+
 def _add_version_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "version", nargs="?", default="latest", help="Asio version, e.g. 1.38.2 (default: latest)"
@@ -56,17 +67,19 @@ def _run_install(args: argparse.Namespace) -> int:
 def _run_build(args: argparse.Namespace) -> int:
     from .maninstall import write_tree
 
+    out = _resolve_dir(args.out)
     version, pages = _build_pages(args)
-    written = write_tree(pages, args.out, compress=not args.no_compress)
-    print(f"wrote {len(written)} page(s) for asio-{version} into {args.out}.")
-    print(f"try: MANPATH={args.out} man asio")
+    written = write_tree(pages, out, compress=not args.no_compress)
+    print(f"wrote {len(written)} page(s) for asio-{version} into {out}.")
+    print(f"try: MANPATH={out} man asio")
     return 0
 
 
 def _run_uninstall(args: argparse.Namespace) -> int:
     from .maninstall import uninstall
 
-    removed = uninstall(args.man_dir)
+    man_dir = _resolve_dir(args.man_dir) if args.man_dir is not None else None
+    removed = uninstall(man_dir)
     print(f"removed {removed} page(s).")
     return 0
 
@@ -75,13 +88,14 @@ def _run_status(args: argparse.Namespace) -> int:
     from .maninstall import status
 
     del args
-    result = status()
-    if not result.installed:
+    installs = status()
+    if not installs:
         print("no asio-doc-tools man pages are installed.")
         return 0
-    when = time.ctime(result.installed_at)
-    breakdown = ", ".join(f"{count} in {section}" for section, count in result.count_by_section)
-    print(f"asio-{result.version} installed into {result.man_dir} on {when} ({breakdown}).")
+    for result in installs:
+        when = time.ctime(result.installed_at)
+        breakdown = ", ".join(f"{count} in {section}" for section, count in result.count_by_section)
+        print(f"asio-{result.version} installed into {result.man_dir} on {when} ({breakdown}).")
     return 0
 
 
@@ -95,7 +109,11 @@ def register(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "--man-dir", type=Path, default=None, help="man tree to install into (default: XDG data dir)"
     )
     _add_source_args(install_parser)
-    install_parser.add_argument("--force", action="store_true", help="overwrite files not installed by this tool")
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite files not installed by this tool (they are then tracked as this tool's own)",
+    )
     install_parser.set_defaults(run=_run_install_with_default_man_dir)
 
     build_parser = man_commands.add_parser("build", help="build man pages into a directory, without installing")
@@ -116,6 +134,5 @@ def register(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
 
 
 def _run_install_with_default_man_dir(args: argparse.Namespace) -> int:
-    if args.man_dir is None:
-        args.man_dir = paths.default_man_dir()
+    args.man_dir = _resolve_dir(args.man_dir if args.man_dir is not None else paths.default_man_dir())
     return _run_install(args)

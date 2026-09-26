@@ -4,11 +4,13 @@ Two ways to get the same tree that `versions.doc_root_url(version)` serves onlin
 a release tarball (fast, one download, preferred) or crawling the live site page
 by page (fallback, many requests). Either way the result lands at
 `paths.cache_dir()/docs/asio-X.Y.Z/doc/` with a `.complete` marker recording how
-it was obtained; a tree without that marker is never returned, so a caller never
-sees a half-populated tree left behind by an interrupted run.
+it was obtained. The marker is written only once the new tree is completely in
+place, and a previous tree (on a `refresh`) is moved aside rather than deleted
+until then, so a caller can never observe a half-populated tree, nor a marker
+left pointing at one a crashed run only partly deleted.
 """
 
-import re
+import os
 import shutil
 import tarfile
 import tempfile
@@ -22,6 +24,7 @@ from bs4 import BeautifulSoup
 
 from . import net, paths
 from .diag import AsioDocsError, note, warn
+from .links import is_bare_external_host
 from .versions import Version, doc_root_url
 
 Source = Literal["auto", "tarball", "online"]
@@ -31,13 +34,6 @@ _TARBALL_MAGIC: Final = b"BZh"
 _REQUIRED_DOC_FILES: Final = ("index.html", "asio/reference.html", "asio/history.html", "asio/overview.html")
 _CRAWL_WORKERS: Final = 8
 _CRAWL_PROGRESS_INTERVAL: Final = 200
-# A handful of pages (e.g. asio/history.html) cite external standards papers with
-# a bare "www.example.org/path" href that has no scheme. No directory in the doc
-# tree has a dot in its name, so a first path segment containing a dot and
-# followed by more path (other than the "." and ".." navigation segments) is an
-# external host missing its "http://", not a same-site relative link; urljoin
-# would otherwise fold it into the current directory as one of our own pages.
-_BARE_EXTERNAL_HOST_RE: Final = re.compile(r"^(?!\.\.?/)[^/]*\.[^/]*/")
 
 # Fetches one URL's bytes; swappable in tests for a fake/local server.
 Fetcher = Callable[[str], bytes]
@@ -64,27 +60,51 @@ def _check_required_files(doc_dir: Path, *, how: str) -> None:
 
 
 def _install_tree(version: Version, populate: Callable[[Path], None], *, how: str) -> Path:
-    """Populate a fresh temp dir under the cache, then move it into place atomically.
+    """Populate a fresh temp dir under the cache, then swap it into place atomically.
 
     `populate` receives an empty directory to fill with the `doc/` tree's contents
     (i.e. `tmp/index.html`, `tmp/asio/...`). Nothing under `_tree_dir(version)` is
     touched until the populated tree is verified and ready to become permanent.
+
+    The swap itself: the marker is removed first (so a tree without one is never
+    mistaken for complete), the old tree (if any) is renamed aside rather than
+    deleted, the new tree is renamed into the old tree's place, the marker is
+    written, and only then is the old tree actually removed. If the process is
+    interrupted anywhere in that sequence, what is left is either the untouched
+    old tree with no marker (so the next call redoes the work) or the new tree
+    with its marker (fully installed); there is no state in between that looks
+    complete.
     """
     tree_dir = _tree_dir(version)
     tree_dir.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(dir=tree_dir.parent, prefix=f".asio-{version}-"))
+    tmp = Path(tempfile.mkdtemp(dir=tree_dir.parent, prefix=f".asio-{version}-new-"))
+    old_aside = tree_dir.parent / f".asio-{version}-old-{os.getpid()}"
+    marker = _marker(version)
+    previous_marker_text = marker.read_text() if marker.is_file() else None
+    moved_old_aside = False
     try:
         doc_tmp = tmp / "doc"
         doc_tmp.mkdir()
         populate(doc_tmp)
         _check_required_files(doc_tmp, how=how)
         if tree_dir.exists():
-            shutil.rmtree(tree_dir)
-        tmp.rename(tree_dir)
+            marker.unlink(missing_ok=True)
+            tree_dir.rename(old_aside)
+            moved_old_aside = True
+        try:
+            tmp.rename(tree_dir)
+        except OSError:
+            if moved_old_aside:
+                old_aside.rename(tree_dir)
+                moved_old_aside = False
+                if previous_marker_text is not None:
+                    marker.write_text(previous_marker_text)
+            raise
+        marker.write_text(f"{how}\n")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    marker = _marker(version)
-    marker.write_text(f"{how}\n")
+        if moved_old_aside:
+            shutil.rmtree(old_aside, ignore_errors=True)
     return _doc_dir(version)
 
 
@@ -98,19 +118,26 @@ def _validate_tarball(body: bytes) -> str | None:
 
 def _extract_doc_tree(archive_path: Path, version: Version, doc_tmp: Path) -> None:
     prefix = f"asio-{version}/doc/"
-    with tarfile.open(archive_path, mode="r:bz2") as archive:
-        members = [m for m in archive.getmembers() if m.name.startswith(prefix) and m.name != prefix]
-        if not members:
-            raise AsioDocsError(f"tarball for asio-{version} has no members under '{prefix}'")
-        for member in members:
-            member.name = member.name[len(prefix) :]
-        try:
-            archive.extractall(doc_tmp, members=members, filter="data")
-        except tarfile.FilterError as e:
-            raise AsioDocsError(
-                f"tarball for asio-{version} contains a member outside its 'doc/' tree ({e}); "
-                "refusing to extract it."
-            ) from e
+    try:
+        with tarfile.open(archive_path, mode="r:bz2") as archive:
+            members = [m for m in archive.getmembers() if m.name.startswith(prefix) and m.name != prefix]
+            if not members:
+                raise AsioDocsError(f"tarball for asio-{version} has no members under '{prefix}'")
+            for member in members:
+                member.name = member.name[len(prefix) :]
+            try:
+                archive.extractall(doc_tmp, members=members, filter="data")
+            except tarfile.FilterError as e:
+                raise AsioDocsError(
+                    f"tarball for asio-{version} contains a member outside its 'doc/' tree ({e}); "
+                    "refusing to extract it."
+                ) from e
+    except (tarfile.ReadError, EOFError, OSError) as e:
+        # A mirror that truncates the download, or answers with a corrupt file that
+        # still happens to start with the bzip2 magic. Reported the same way as any
+        # other tarball problem, so "auto" falls back to crawling instead of a raw
+        # traceback from deep inside tarfile.
+        raise AsioDocsError(f"tarball for asio-{version} at {archive_path} is corrupt or truncated: {e}") from e
 
 
 def _fetch_tarball(version: Version) -> Path | None:
@@ -139,9 +166,7 @@ def _ensure_via_tarball(version: Version) -> Path:
 
 
 def _is_same_site_link(href: str) -> bool:
-    return bool(href) and not href.startswith(("http://", "https://", "mailto:")) and not (
-        _BARE_EXTERNAL_HOST_RE.match(href)
-    )
+    return bool(href) and not href.startswith(("http://", "https://", "mailto:")) and not is_bare_external_host(href)
 
 
 def _links_of(html: bytes) -> Iterable[str]:
@@ -151,13 +176,25 @@ def _links_of(html: bytes) -> Iterable[str]:
             yield href
 
 
+def _is_safe_relative_html_path(relative: str) -> bool:
+    """False for anything that could not be joined onto doc_tmp without escaping it.
+
+    A URL with an unexpected extra slash (e.g. ".../doc//etc/x.html") can, after
+    the root prefix is stripped, leave a path that starts with "/" or contains a
+    "." or ".." segment; `Path` joins an absolute path by discarding the base
+    entirely, so that would otherwise write outside the doc tree.
+    """
+    if not relative or relative.startswith("/"):
+        return False
+    return all(segment not in ("", ".", "..") for segment in relative.split("/"))
+
+
 def _relative_path(root: str, url: str) -> str | None:
     """The path of `url` relative to `root`, or None if it falls outside the doc root."""
     if not url.startswith(root):
         return None
-    relative = url[len(root) :]
-    relative = urlsplit(relative).path  # drop any leftover query string
-    return relative or None
+    relative = urlsplit(url[len(root) :]).path  # drop any leftover query string
+    return relative if _is_safe_relative_html_path(relative) else None
 
 
 def _crawl(root: str, doc_tmp: Path, fetcher: Fetcher) -> None:
@@ -185,6 +222,10 @@ def _crawl(root: str, doc_tmp: Path, fetcher: Fetcher) -> None:
                     failed[path] = str(e)
                     continue
                 destination = doc_tmp / path
+                # _relative_path (the only source of `pending`, besides the trivially
+                # safe "index.html" seed) already rejects anything that could escape
+                # doc_tmp; this is the last-resort check on that invariant.
+                assert destination.resolve().is_relative_to(doc_tmp.resolve()), path
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(body)
                 for href in _links_of(body):
