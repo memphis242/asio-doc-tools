@@ -3,14 +3,17 @@
 import argparse
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import paths
 from .diag import note
-from .docsource import Source, ensure_doc_tree
 from .manpage import ManPage
 from .versions import Version, resolve
 
-_SOURCE_CHOICES: tuple[Source, ...] = ("auto", "tarball", "online")
+if TYPE_CHECKING:
+    from .docsource import Source
+
+_SOURCE_CHOICES: "tuple[Source, ...]" = ("auto", "tarball", "online")
 
 
 def _resolve_dir(path: Path) -> Path:
@@ -42,6 +45,8 @@ def _build_pages(args: argparse.Namespace) -> tuple[Version, tuple[ManPage, ...]
     from .mangen import build_pages
 
     version = resolve(args.version, refresh=args.refresh)
+    from .docsource import ensure_doc_tree
+
     doc_dir = ensure_doc_tree(version, source=args.source, refresh=args.refresh)
     note(f"generating man pages for asio-{version} from {doc_dir}...")
     return version, build_pages(doc_dir, version)

@@ -12,8 +12,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
 
-from bs4 import BeautifulSoup
-
 from . import classify, history, versions
 from .diag import AsioDocsError, warn
 from .history import Entry, Release
@@ -137,10 +135,7 @@ def resolve_range(
 
 def _entry_markdown_text(entry: Entry) -> str:
     """`entry`'s text as markdown: inline <code> spans become backticks, other markup is stripped."""
-    soup = BeautifulSoup(entry.html, "lxml")
-    for code in soup.find_all("code"):
-        code.replace_with(f"`{history.normalize_text(code)}`")
-    return " ".join(soup.get_text().split())
+    return history.entry_text_with_code(entry, code=lambda text: f"`{text}`")
 
 
 def build_diff_result(

@@ -7,13 +7,10 @@ stale copy is used with a warning, so the tools keep working offline.
 """
 
 import hashlib
-import http.client
 import json
 import os
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Final
@@ -43,6 +40,12 @@ def fetch(
     attempts: int = DEFAULT_ATTEMPTS,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> bytes:
+    # Imported here rather than at module level: they cost tens of milliseconds, and a
+    # run served entirely from the cache never needs them.
+    import http.client
+    import urllib.error
+    import urllib.request
+
     assert attempts >= 1
     last_failure = "no attempt made"
     for attempt in range(1, attempts + 1):

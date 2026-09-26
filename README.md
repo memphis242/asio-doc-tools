@@ -78,7 +78,7 @@ bullet is only ever sent once: repeated diffs are instant, free, and stable.
 
 | Location | Content |
 |---|---|
-| `~/.cache/asio-doc-tools/` | HTTP cache, release tarballs, extracted doc trees (safe to delete) |
+| `~/.cache/asio-doc-tools/` | HTTP cache, release tarballs, extracted doc trees, parsed revision history (safe to delete) |
 | `~/.local/share/asio-doc-tools/classifications.sqlite3` | Stored classifications, one row per bullet with its text (paid for; keep it). Query it with `sqlite3` |
 | `~/.local/share/asio-doc-tools/installed-man-pages.json` | Install manifest |
 

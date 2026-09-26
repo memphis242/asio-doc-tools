@@ -15,7 +15,6 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -37,8 +36,12 @@ PROMPT_VERSION: Final = "classify-2"
 MODEL: Final = "claude-sonnet-5"
 EFFORT: Final = "low"
 _MAX_TOKENS: Final = 16000
+# A request's latency grows with its batch (about 0.9 s + 0.24 s per entry at low
+# effort) and is unaffected by up to 8 requests in flight, so throughput scales with
+# the worker count: the whole history (about 1,000 entries, 25 batches) takes 4
+# rounds of requests with 8 workers, against 7 with 4, for the same batches and cost.
 _BATCH_SIZE: Final = 40
-_MAX_WORKERS: Final = 4
+_MAX_WORKERS: Final = 8
 
 
 class Category(StrEnum):
@@ -595,6 +598,10 @@ def classify(
                 f"classifying {len(pending_keys)} unlabeled entries in {len(batches)} requests "
                 f"with {MODEL}..."
             )
+
+            # Imported only when there is something to send: the import costs every
+            # cached run (and every other command) tens of milliseconds.
+            from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 
             client = client_factory()
             total_input = total_output = 0
