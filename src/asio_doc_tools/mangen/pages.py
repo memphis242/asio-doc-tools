@@ -16,11 +16,9 @@ does not depend on scheduling.
 
 import os
 import re
-import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from multiprocessing import get_context
 from pathlib import Path
 from typing import Final
 from urllib.parse import urljoin
@@ -379,18 +377,12 @@ def _build_unit(unit: Unit) -> ManPage:
 
 
 def _run[T, R](fn: Callable[[T], R], items: Sequence[T], state: _WorkerState) -> list[R]:
-    """Map `fn` over `items`, in worker processes when that pays off; results keep input order.
-
-    Workers are forked: that needs no importable __main__ (unlike spawn/forkserver)
-    and is safe because it is only done while this process is single-threaded.
-    """
+    """Map `fn` over `items`, in worker processes when that pays off; results keep input order."""
     workers = os.process_cpu_count() or 1
-    if len(items) < _PARALLEL_MIN_ITEMS or workers < 2 or threading.active_count() > 1:
+    if len(items) < _PARALLEL_MIN_ITEMS or workers < 2:
         _init_worker(state)
         return [fn(item) for item in items]
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=get_context("fork"), initializer=_init_worker, initargs=(state,)
-    ) as pool:
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(state,)) as pool:
         return list(pool.map(fn, items, chunksize=_CHUNK_SIZE))
 
 

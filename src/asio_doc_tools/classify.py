@@ -22,7 +22,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
 
-import anthropic
 
 from . import paths
 from .diag import AsioDocsError, note
@@ -138,7 +137,13 @@ SCHEMA: Final = {
 ClientFactory = Callable[[], Any]
 
 
+# The SDK is imported where it is used: importing it costs over a second, which
+# every other command (and every man page build worker) would otherwise pay.
+
+
 def default_client_factory() -> Any:
+    import anthropic
+
     return anthropic.Anthropic(max_retries=4)
 
 
@@ -337,6 +342,8 @@ def _build_payload(ids: Sequence[str], batch_keys: Sequence[str], texts: dict[st
 
 
 def _send(client: Any, payload: str) -> Any:
+    import anthropic
+
     try:
         return client.messages.create(
             model=MODEL,
