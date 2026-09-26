@@ -16,14 +16,17 @@ and the run prints what it expects to spend before its first request and what it
 used on every exit. The "Run budget" section below has the arithmetic.
 """
 
+import contextlib
 import json
 import math
 import os
+import re
+import signal
 import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -353,10 +356,23 @@ def _row_key(prompt_version: str, model: str, effort: str, text: str) -> str:
 assert _row_key(PROMPT_VERSION, MODEL, EFFORT, " Fixed a bug.\n") == _cache_key("Fixed a bug.")
 
 
-def _upsert_classifications(conn: sqlite3.Connection, rows: Sequence[_StoreRow], path: Path) -> None:
-    """Writes `rows` in one transaction: on any failure none of them are stored."""
+# How long a store write waits for another process's lock before failing.
+_STORE_LOCK_WAIT_S: Final = 10.0
+
+
+def _upsert_classifications(
+    conn: sqlite3.Connection,
+    rows: Sequence[_StoreRow],
+    path: Path,
+    *,
+    lock_wait_s: float = _STORE_LOCK_WAIT_S,
+) -> None:
+    """Writes `rows` in one transaction, waiting up to `lock_wait_s` for the store's lock:
+    on any failure none of them are stored."""
     assert rows
+    assert 0.0 <= lock_wait_s <= _STORE_LOCK_WAIT_S
     try:
+        conn.execute(f"PRAGMA busy_timeout = {int(lock_wait_s * 1000)}")
         with conn:
             conn.executemany(
                 _UPSERT_SQL,
@@ -390,7 +406,7 @@ def stored_keys(store_path: Path | None = None) -> frozenset[str]:
     """Every key currently in the store, for read-only inspection (e.g. `releases`).
 
     Opens the store read-only and never creates it: no store yet means nothing is
-    classified yet. Results waiting in the pending file (see `_import_pending`) are not
+    classified yet. Results waiting in the pending directory (see `_import_pending`) are not
     counted until a classify() run imports them.
     """
     path = store_path if store_path is not None else default_store_path()
@@ -438,14 +454,27 @@ def _check_store_writable(conn: sqlite3.Connection, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The pending file
+# The pending directory
 #
 # When a batch's results cannot be written to the store in the middle of a run (the
-# disk fills up, a lock outlasts its timeout), they are appended to a pending file next
-# to the store, one JSON object per line, so they are not paid for again. Every
-# classify() run imports that file into the store before working out what is missing,
-# then deletes it. A line that fails validation stops the run with an error naming the
-# file and the line, and the file is kept.
+# disk fills up, a lock outlasts its timeout), or when a run is abandoned (see
+# _Waiting.abandon), they are saved to a pending directory next to the store, so they
+# are not paid for again. Every classify() run imports that directory into the store
+# before working out what is missing.
+#
+# Every save is its own file, never appended to: its lines go to a temporary file
+# (".tmp-<name>"), which is fsynced, renamed to its final name ("<name>"), and the
+# directory fsynced, so a final file is always complete. A save that fails midway (a
+# full disk, an interrupt) removes its temporary file, and its results go to stderr as
+# JSON lines instead. An import claims each file first by renaming it to a name unique
+# to this process (".claimed-<time>-<pid>-<uuid>-<name>"), imports it in one
+# transaction, and deletes it; a failed import renames it back. So two runs never import
+# or delete one file twice, and a file whose import fails stays for a later run.
+# Files left by a process that died (a temporary or claimed file over an hour old) are
+# imported too, a temporary one without its torn last line, if any.
+#
+# Every line of a file is validated as strictly as a reply. An invalid line stops the run
+# with an error naming the file and the line, and the file is kept for the user.
 # ---------------------------------------------------------------------------
 
 _PENDING_FIELDS: Final = frozenset(
@@ -471,10 +500,19 @@ _PENDING_STRING_FIELDS: Final = (
     "release",
     "text",
 )
+# <time in ns>-<pid>-<uuid>.jsonl; temporary and claimed files add a prefix to it.
+_PENDING_NAME_RE: Final = re.compile(r"(?P<ns>[0-9]{1,20})-[0-9]{1,10}-[0-9a-f]{32}\.jsonl")
+_PENDING_TEMP_PREFIX: Final = ".tmp-"
+_PENDING_CLAIMED_RE: Final = re.compile(
+    r"\.claimed-(?P<ns>[0-9]{1,20})-[0-9]{1,10}-[0-9a-f]{32}-(?P<inner>.+)"
+)
+# A temporary or claimed file this old belongs to a process that died: writing or
+# importing one file takes well under a second.
+_PENDING_ORPHAN_AGE_NS: Final = 3_600 * 1_000_000_000
 
 
-def _pending_path(store_path: Path) -> Path:
-    return store_path.with_name(f"{store_path.stem}.pending.jsonl")
+def _pending_dir(store_path: Path) -> Path:
+    return store_path.with_name(f"{store_path.stem}.pending")
 
 
 def _pending_record(row: _StoreRow) -> dict[str, Any]:
@@ -538,35 +576,76 @@ def _parse_pending_line(line: str) -> _StoreRow:
     )
 
 
-def _append_pending(path: Path, rows: Sequence[_StoreRow]) -> None:
-    """Appends `rows` to the pending file in one write, then fsyncs it."""
-    assert rows
-    data = memoryview(_pending_lines(rows).encode())
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+def _unique_suffix() -> str:
+    """<time in ns>-<pid>-<32 random hex digits>: unique across processes and calls."""
+    return f"{time.time_ns()}-{os.getpid()}-{os.urandom(16).hex()}"
+
+
+def _unique_pending_name() -> str:
+    name = f"{_unique_suffix()}.jsonl"
+    assert _PENDING_NAME_RE.fullmatch(name)
+    return name
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        while data:
-            data = data[os.write(fd, data) :]
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
-def _import_pending(conn: sqlite3.Connection, store_path: Path) -> None:
-    """Moves the results an earlier run could not store from the pending file into the store."""
-    path = _pending_path(store_path)
+def _save_pending(store_path: Path, rows: Sequence[_StoreRow]) -> Path:
+    """Saves `rows` as a new, complete file in the pending directory, and returns its path.
+
+    Raises OSError when that fails, having removed its temporary file; an interrupt
+    midway removes it too, so no partial file is ever left under a final name.
+    """
+    assert rows
+    directory = _pending_dir(store_path)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    name = _unique_pending_name()
+    temporary = directory / f"{_PENDING_TEMP_PREFIX}{name}"
+    final = directory / name
     try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return
-    except OSError as e:
-        raise AsioDocsError(
-            f"could not read {path} ({e}), which holds paid-for classifications an earlier run "
-            "could not store; make it readable, then rerun"
-        ) from e
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            _write_all(fd, _pending_lines(rows).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, final)
+    except BaseException:
+        # The rows are reported elsewhere by the caller; what was written of them is not
+        # worth an error of its own, and a file left behind is imported once orphaned.
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+    _fsync_dir(directory)
+    return final
+
+
+def _pending_rows(path: Path, raw: bytes, *, torn_tail_allowed: bool) -> tuple[_StoreRow, ...]:
+    """The rows of one pending file, or AsioDocsError naming the file and the bad line."""
     kept = (
-        "it holds paid-for classifications an earlier run could not store, so it is kept: fix or "
-        "delete that line, then rerun"
+        "it holds paid-for classifications a run could not store, so it is kept: fix or delete that "
+        "line, then rerun"
     )
+    if not raw.endswith(b"\n") and raw:
+        if not torn_tail_allowed:
+            raise AsioDocsError(f"{path} ends without a newline, so its last line is incomplete; {kept}")
+        cut = raw.rfind(b"\n") + 1
+        warn(
+            f"{path} was being written when its process stopped; its incomplete last line "
+            f"({len(raw) - cut} bytes) cannot be read and is left out"
+        )
+        raw = raw[:cut]
     try:
         lines = raw.decode("utf-8").splitlines()
     except UnicodeDecodeError as e:
@@ -579,14 +658,102 @@ def _import_pending(conn: sqlite3.Connection, store_path: Path) -> None:
             raise AsioDocsError(
                 f"line {number} of {path} is not a valid saved classification ({e}); {kept}"
             ) from e
-    if rows:
-        _upsert_classifications(conn, rows, store_path)  # on failure the file stays for the next run
+    return tuple(rows)
+
+
+def _pending_candidates(directory: Path, now_ns: int) -> tuple[tuple[str, str], ...]:
+    """(name in the directory, its unclaimed name) of every file an import should take:
+    every final file, and every temporary or claimed file orphaned by a dead process."""
     try:
-        path.unlink()
+        names = sorted(entry.name for entry in os.scandir(directory) if entry.is_file(follow_symlinks=False))
+    except FileNotFoundError:
+        return ()
     except OSError as e:
-        warn(f"imported {path} into the store but could not delete it ({e}); the next run imports it again")
-        return
-    note(f"imported {_count(len(rows), 'classification')} saved by an earlier run from {path}")
+        raise AsioDocsError(
+            f"could not list {directory} ({e}), which holds paid-for classifications a run could not "
+            "store; make it readable, then rerun"
+        ) from e
+    candidates: list[tuple[str, str]] = []
+    for name in names:
+        if _PENDING_NAME_RE.fullmatch(name):
+            candidates.append((name, name))
+        elif name.startswith(_PENDING_TEMP_PREFIX):
+            match = _PENDING_NAME_RE.fullmatch(name.removeprefix(_PENDING_TEMP_PREFIX))
+            if match is not None and now_ns - int(match["ns"]) > _PENDING_ORPHAN_AGE_NS:
+                candidates.append((name, name))
+        elif (claimed := _PENDING_CLAIMED_RE.fullmatch(name)) is not None:
+            if now_ns - int(claimed["ns"]) > _PENDING_ORPHAN_AGE_NS:
+                candidates.append((name, claimed["inner"]))
+    return tuple(candidates)
+
+
+def _import_pending_file(conn: sqlite3.Connection, store_path: Path, name: str, unclaimed: str) -> int | None:
+    """Claims, imports, and deletes one pending file; returns how many rows it held, or None
+    when another run claimed it first."""
+    directory = _pending_dir(store_path)
+    claimed = directory / f".claimed-{_unique_suffix()}-{unclaimed}"
+    original = directory / unclaimed
+    try:
+        os.rename(directory / name, claimed)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise AsioDocsError(
+            f"could not claim {directory / name} to import it ({e}); fix its permissions, then rerun"
+        ) from e
+    try:
+        raw = claimed.read_bytes()
+        rows = _pending_rows(original, raw, torn_tail_allowed=unclaimed.startswith(_PENDING_TEMP_PREFIX))
+        if rows:
+            _upsert_classifications(conn, rows, store_path)
+    except BaseException as failure:
+        try:
+            os.rename(claimed, original)
+        except OSError as e:
+            failure.add_note(
+                f"{claimed} could not be renamed back to {original} ({e}); a run in an hour takes it"
+            )
+        if isinstance(failure, OSError):
+            raise AsioDocsError(
+                f"could not read {original} ({failure}); make it readable, then rerun"
+            ) from failure
+        raise
+    try:
+        claimed.unlink()
+    except OSError as e:
+        warn(
+            f"imported {original} into the store but could not delete it ({e}); a later run imports it again"
+        )
+    return len(rows)
+
+
+def _import_pending(conn: sqlite3.Connection, store_path: Path) -> None:
+    """Moves the results earlier runs could not store from the pending directory into the store."""
+    imported = 0
+    for name, unclaimed in _pending_candidates(_pending_dir(store_path), time.time_ns()):
+        rows = _import_pending_file(conn, store_path, name, unclaimed)
+        imported += rows if rows is not None else 0
+    if imported:
+        note(
+            f"imported {_count(imported, 'classification')} saved by an earlier run from "
+            f"{_pending_dir(store_path)}"
+        )
+
+
+@contextlib.contextmanager
+def _sigint_ignored() -> Iterator[None]:
+    """Ignores Ctrl-C (on the main thread, the only one a signal handler can be set from).
+
+    Replacing the handler is what protects the main thread: blocking SIGINT on it with
+    pthread_sigmask does not, since the kernel then delivers it to a worker thread and
+    Python still raises KeyboardInterrupt on the main thread.
+    """
+    assert threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous if previous is not None else signal.SIG_DFL)
 
 
 # ---------------------------------------------------------------------------
@@ -661,8 +828,9 @@ def _batch_payload(batch_keys: Sequence[str], texts: Mapping[str, str]) -> tuple
 #   output tokens  T = (min(8, B) + 3) * 7,168 + 128 N
 #   input tokens   I = (b_1 + ... + b_B) + (R - B) * max(b_i)
 #   time           no attempt starts more than 300 s after the run started
-#   wall clock     at 560 s the run stops waiting: it stores whatever finished, reports,
-#                  and exits (status 1), abandoning any request still in flight
+#   wall clock     at 560 s the run stops waiting: it saves whatever finished to the
+#                  pending directory, reports, and exits (status 1), abandoning any
+#                  request still in flight
 #
 # Before sending, an attempt reserves its whole max_tokens and its input bound, and is
 # refused unless, for output and for input alike, billed + possibly billed + reserved +
@@ -671,7 +839,10 @@ def _batch_payload(batch_keys: Sequence[str], texts: Mapping[str, str]) -> tuple
 # was never made) refunds them; a timeout or a connection dropped mid-request keeps them
 # as possibly billed. So billed output <= T, billed input <= I, and requests <= R,
 # whatever happens. Every request beyond the first per batch (a half, a resend, a retry)
-# carries at most one batch's payload, which is why (R - B) * max(b_i) covers them.
+# carries at most one batch's payload, which is why (R - B) * max(b_i) covers them. A
+# response billed for more than its reservation (the API passing max_tokens, or text
+# taking more tokens than bytes) stops the run, since the caps then prove nothing: only
+# the requests already in flight finish.
 #
 # Why these numbers. Up to 8 requests are in flight, each reserving up to 7,168, so a
 # run needs min(8, B) * 7,168 of headroom for reservations alone. On top of that, 128 per
@@ -699,7 +870,10 @@ def _batch_payload(batch_keys: Sequence[str], texts: Mapping[str, str]) -> tuple
 # arrives whole once generated, and a full-size 7,168 tokens takes about 57 s at the
 # observed 126 tokens/s: about 4x margin), or after 10 s trying to connect. Retry waits
 # end at the time limit, so the last attempt starts by 300 s and, unless its reply
-# arrives a byte at a time, ends by 550 s. The watchdog at 560 s bounds even that.
+# arrives a byte at a time, ends by 550 s. The watchdog at 560 s bounds even that: no
+# batch is harvested after it, a store write waits for another process's lock only until
+# it, and abandoning the run writes nothing but one pending file (with Ctrl-C ignored)
+# before exiting, so the process ends within moments of 560 s.
 #
 # Stopping. The first error, cap refusal, store-write failure, or Ctrl-C sets the run's
 # stop flag, which every attempt checks first: from then on no request is sent, only the
@@ -1019,11 +1193,29 @@ class _RunBudget:
             return _Reservation(serial=self._requests, max_tokens=max_tokens, input_bound=input_bound)
 
     def settle_billed(self, reservation: _Reservation, *, input_tokens: int, output_tokens: int) -> None:
-        """A response arrived: its reservations become the usage it reports."""
+        """A response arrived: its reservations become the usage it reports.
+
+        Usage over a reservation means the bound behind it (max_tokens for output, bytes >=
+        tokens for input) does not hold, so the caps no longer prove anything: the stop
+        flag is set, and only the requests already in flight finish. The response itself
+        is paid for and kept.
+        """
         with self._lock:
             self._release(reservation)
             self._billed_input += input_tokens
             self._billed_output += output_tokens
+            for kind, billed, bound in (
+                ("input", input_tokens, reservation.input_bound),
+                ("output", output_tokens, reservation.max_tokens),
+            ):
+                if billed > bound:
+                    self._stop.trip(
+                        AsioDocsError(
+                            f"the API billed {billed:,} {kind} tokens for a request whose computed upper "
+                            f"bound was {bound:,}, so this run's hard caps no longer hold and it stopped; "
+                            "please report this"
+                        )
+                    )
 
     def settle_failed(self, reservation: _Reservation, *, possibly_billed: bool) -> None:
         """No usable response: the reservations are refunded, or kept as possibly billed."""
@@ -1461,10 +1653,11 @@ class _Harvester:
     batch harvested stays stored whatever happens to the run afterwards.
 
     Never raises for a batch's own failure. A store-write failure sets the stop flag with
-    that error as the reason, and the batch's results go to the pending file instead (see
-    `_import_pending`), or, if even that fails, to stderr as JSON lines. A worker's
+    that error as the reason, and the batch's results go to the pending directory instead
+    (see `_import_pending`), or, if even that fails, to stderr as JSON lines. A worker's
     unexpected exception is kept (the first one) for the caller to raise once every batch
-    is harvested.
+    is harvested. A store write waits for another process's lock no longer than
+    `lock_wait_s()` allows, so harvesting never holds the run past its watchdog.
     """
 
     def __init__(
@@ -1475,10 +1668,11 @@ class _Harvester:
         texts: Mapping[str, str],
         release_by_key: Mapping[str, Version],
         stop: _StopFlag,
+        lock_wait_s: Callable[[], float],
     ) -> None:
         self._conn: Final = conn
         self._store_path: Final = store_path
-        self._pending_path: Final = _pending_path(store_path)
+        self._lock_wait_s: Final = lock_wait_s
         self._store: Final = store
         self._texts: Final = texts
         self._release_by_key: Final = release_by_key
@@ -1512,14 +1706,31 @@ class _Harvester:
         # and leaves this future to be harvested again.
         self._harvested.add(future)
 
+    def save_for_later(self, futures: Sequence["Future[_BatchOutcome]"]) -> None:
+        """For a run being abandoned: saves the results of every finished batch not yet
+        harvested to the pending directory, without touching the store, whose lock could
+        make it wait. The next run imports them."""
+        rows: list[_StoreRow] = []
+        for future in futures:
+            if not future.done() or future.cancelled() or future in self._harvested:
+                continue
+            try:
+                outcome = future.result()
+            except BaseException as e:  # _classify_batch never raises; this keeps a bug in it visible
+                outcome = _BatchOutcome({}, failure=e)
+            rows.extend(self._rows(outcome.classified))
+            self._harvested.add(future)
+        if rows:
+            self._save_elsewhere(rows)
+
     def progress(self, total: int) -> str:
         parts = [
             f"{len(self._stored_keys)} of {_count(total, 'entry', 'entries')} were classified and stored"
         ]
         if self._saved_to_pending:
             parts.append(
-                f"{_count(self._saved_to_pending, 'more was', 'more were')} saved to {self._pending_path} "
-                "and go into the store at the start of the next run"
+                f"{_count(self._saved_to_pending, 'more was', 'more were')} saved to "
+                f"{_pending_dir(self._store_path)} and go into the store at the start of the next run"
             )
         if self._printed:
             parts.append(
@@ -1550,7 +1761,7 @@ class _Harvester:
 
     def _store_rows(self, rows: Sequence[_StoreRow]) -> None:
         try:
-            _upsert_classifications(self._conn, rows, self._store_path)
+            _upsert_classifications(self._conn, rows, self._store_path, lock_wait_s=self._lock_wait_s())
         except AsioDocsError as e:
             self._stop.trip(e)
             self._save_elsewhere(rows)
@@ -1560,12 +1771,13 @@ class _Harvester:
         self._stored_keys.update(row.key for row in rows)
 
     def _save_elsewhere(self, rows: Sequence[_StoreRow]) -> None:
+        directory = _pending_dir(self._store_path)
         try:
-            _append_pending(self._pending_path, rows)
+            _save_pending(self._store_path, rows)
         except OSError as e:
             warn(
-                f"could not save {_count(len(rows), 'paid-for classification')} to {self._pending_path} "
-                f"either ({e}); here they are as JSON lines, which that file would have held:\n"
+                f"could not save {_count(len(rows), 'paid-for classification')} to {directory} "
+                f"either ({e}); here they are as JSON lines, as a file there would have held them:\n"
                 + _pending_lines(rows).rstrip("\n")
             )
             self._printed += len(rows)
@@ -1580,11 +1792,13 @@ _Harvest = Callable[["Future[_BatchOutcome]"], None]
 class _Waiting:
     """How the main thread waits for a run's batches, and gives up on them.
 
-    Every wait ends at the watchdog (`watchdog_at`, on `clock`), after which the run is
-    abandoned: whatever finished is stored, usage is reported, and the process exits.
+    Every wait ends at the watchdog (`watchdog_at`, on `clock`), and no batch is harvested
+    after it: the run is abandoned instead. Whatever finished is saved for the next run,
+    usage is reported, and the process exits.
     """
 
     harvest: _Harvest
+    save_for_later: Callable[[Sequence["Future[_BatchOutcome]"]], None]
     stop: _StopFlag
     watchdog_at: float
     clock: Callable[[], float]
@@ -1600,7 +1814,7 @@ class _Waiting:
         stopping = False
         try:
             for future in as_completed(futures, timeout=self._seconds_to_watchdog()):
-                self.harvest(future)
+                self._harvest_unless_watchdog(future, futures)
                 if self.stop.is_set() and not stopping:
                     stopping = True
                     for queued in futures:
@@ -1634,7 +1848,7 @@ class _Waiting:
         def harvest_one(future: "Future[_BatchOutcome]") -> None:
             nonlocal first_error
             try:
-                self.harvest(future)
+                self._harvest_unless_watchdog(future, futures)
             except Exception as e:
                 if first_error is None:
                     first_error = e
@@ -1663,34 +1877,42 @@ class _Waiting:
     def abandon(
         self, futures: Sequence["Future[_BatchOutcome]"], *, status: int, message: str | None
     ) -> NoReturn:
-        """Stops waiting: stores every batch that finished, prints `message` (as an error,
-        followed by what was stored) or, without one, a note that the requests in flight
-        were abandoned, reports usage (counting what is still in flight as possibly
-        billed), and exits the process at once with `status`. A normal exit would wait for
-        the (not daemonic) worker threads. What was harvested is already committed."""
-        in_flight = sum(1 for future in futures if not future.done())
-        try:
-            for future in futures:
-                if future.done():
-                    try:
-                        self.harvest(future)
-                    except Exception as e:
-                        warn(f"could not store a finished batch while abandoning the run: {e!r}")
-        except KeyboardInterrupt:
-            pass  # a Ctrl-C here means out at once: the remaining stores are skipped
-        try:
-            if message is not None:
-                error(f"{message}; {self.progress()}. {_RERUN_HINT}")
-            else:
-                spend(
-                    f"abandoned {_count(in_flight, 'in-flight request')}, which may still be billed; "
-                    f"{self.progress()}"
-                )
-            self.report_usage()
-            sys.stdout.flush()
-            sys.stderr.flush()
-        finally:
-            self.exit_process(status)
+        """Stops waiting and exits the process at once with `status`: a normal exit would
+        wait for the (not daemonic) worker threads.
+
+        Before exiting it saves every finished batch not harvested yet to the pending
+        directory (never to the store, whose lock could make it wait), prints `message` as
+        an error followed by what was stored or, without one, a note that the requests in
+        flight were abandoned, and reports usage, counting what is still in flight as
+        possibly billed. Ctrl-C is ignored meanwhile, so it cannot cut the save short.
+        """
+        with _sigint_ignored():
+            try:
+                in_flight = sum(1 for future in futures if not future.done())
+                try:
+                    self.save_for_later(futures)
+                except Exception as e:
+                    warn(f"could not save the finished batches while abandoning the run: {e!r}")
+                if message is not None:
+                    error(f"{message}; {self.progress()}. {_RERUN_HINT}")
+                else:
+                    spend(
+                        f"abandoned {_count(in_flight, 'in-flight request')}, which may still be billed; "
+                        f"{self.progress()}"
+                    )
+                self.report_usage()
+                sys.stdout.flush()
+                sys.stderr.flush()
+            finally:
+                self.exit_process(status)
+
+    def _harvest_unless_watchdog(
+        self, future: "Future[_BatchOutcome]", futures: Sequence["Future[_BatchOutcome]"]
+    ) -> None:
+        # as_completed yields every future already finished before checking its timeout.
+        if self._seconds_to_watchdog() <= 0:
+            self._watchdog_fired(futures)
+        self.harvest(future)
 
     def _seconds_to_watchdog(self) -> float:
         return max(0.0, self.watchdog_at - self.clock())
@@ -1740,7 +1962,12 @@ def _run_batches(
     stop = _StopFlag()
     budget = _RunBudget(caps, stop)
     ctx = _RunContext(client=client, budget=budget)
-    harvest = _Harvester(conn, store_path, store, texts, release_by_key, stop)
+    watchdog_at = budget.started_at + _watchdog_s()
+
+    def store_lock_wait_s() -> float:
+        return min(_STORE_LOCK_WAIT_S, max(0.0, watchdog_at - budget.clock()))
+
+    harvest = _Harvester(conn, store_path, store, texts, release_by_key, stop, store_lock_wait_s)
     usage_reported = False
 
     def report_usage() -> None:
@@ -1751,8 +1978,9 @@ def _run_batches(
 
     waiting = _Waiting(
         harvest=harvest,
+        save_for_later=harvest.save_for_later,
         stop=stop,
-        watchdog_at=budget.started_at + _watchdog_s(),
+        watchdog_at=watchdog_at,
         clock=budget.clock,
         progress=lambda: harvest.progress(len(pending)),
         report_usage=report_usage,

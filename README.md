@@ -93,7 +93,7 @@ exits at once, and so does a run still waiting after about 9 minutes.
 |---|---|
 | `~/.cache/asio-doc-tools/` | HTTP cache, release tarballs, extracted doc trees, parsed revision history (safe to delete) |
 | `~/.local/share/asio-doc-tools/classifications.sqlite3` | Stored classifications, one row per bullet with its text (paid for; keep it). Query it with `sqlite3` |
-| `~/.local/share/asio-doc-tools/classifications.pending.jsonl` | Answers a run paid for but could not write to the store (a full disk, say), one JSON object per line; the next run moves them into the store. Normally absent |
+| `~/.local/share/asio-doc-tools/classifications.pending/` | Answers a run paid for but could not write to the store (a full disk, say, or a run stopped by its time limit), one file per save, one JSON object per line; the next run moves them into the store. Normally empty or absent |
 | `~/.local/share/asio-doc-tools/installed-man-pages.json` | Install manifest |
 
 XDG base directory variables (`XDG_CACHE_HOME`, `XDG_DATA_HOME`) are honored.

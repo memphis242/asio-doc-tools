@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import signal
@@ -379,6 +380,9 @@ def test_database_error_at_write_time_is_reported_with_the_store_path(tmp_path) 
 
         def __exit__(self, *exc_info):
             return False
+
+        def execute(self, *args, **kwargs):
+            return None  # the lock-wait pragma
 
         def executemany(self, *args, **kwargs):
             raise sqlite3.DatabaseError("simulated corruption detected mid-write")
@@ -906,12 +910,15 @@ def test_ctrl_c_keeps_in_flight_results_and_sends_nothing_more(tmp_path, monkeyp
     assert "used 2 requests" in err
 
 
-def _waiting(harvest, *, stop=None, watchdog_in_s=10.0, report_usage=lambda: None) -> classify._Waiting:
+def _waiting(
+    harvest, *, save_for_later=lambda futures: None, stop=None, watchdog_in_s=10.0, report_usage=lambda: None
+) -> classify._Waiting:
     if stop is None:
         stop = classify._StopFlag()
         stop.trip(AsioDocsError("interrupted"))
     return classify._Waiting(
         harvest=harvest,
+        save_for_later=save_for_later,
         stop=stop,
         watchdog_at=time.monotonic() + watchdog_in_s,
         clock=time.monotonic,
@@ -927,11 +934,15 @@ def test_first_ctrl_c_cancels_queued_batches_and_harvests_in_flight_ones(capsys)
     in_flight: Future = Future()
     assert in_flight.set_running_or_notify_cancel()
     queued: Future = Future()
-    threading.Timer(0.02, lambda: in_flight.set_result(classify._BatchOutcome({}))).start()
     harvested: list[Future] = []
 
+    def harvest(future: Future) -> None:
+        harvested.append(future)
+        if future is done:  # stop_and_harvest has counted what is in flight by now
+            threading.Timer(0.02, lambda: in_flight.set_result(classify._BatchOutcome({}))).start()
+
     error = _waiting(
-        harvested.append, report_usage=lambda: pytest.fail("usage is reported by the caller on this path")
+        harvest, report_usage=lambda: pytest.fail("usage is reported by the caller on this path")
     ).stop_and_harvest([done, in_flight, queued], interrupted=True)
 
     assert error is None
@@ -965,19 +976,26 @@ def test_second_ctrl_c_abandons_in_flight_requests_and_exits_at_once(capsys) -> 
     in_flight: Future = Future()
     assert in_flight.set_running_or_notify_cancel()
     harvested: list[Future] = []
+    saved: list[list[Future]] = []
     reported: list[bool] = []
-    threading.Timer(0.02, _interrupt_main_thread).start()
+
+    def harvest(future: Future) -> None:
+        harvested.append(future)
+        threading.Timer(0.02, _interrupt_main_thread).start()  # arrives while the drain waits
+
     try:
         with pytest.raises(_Exited) as excinfo:
-            _waiting(harvested.append, report_usage=lambda: reported.append(True)).stop_and_harvest(
-                [done, in_flight], interrupted=True
-            )
+            _waiting(
+                harvest,
+                save_for_later=lambda futures: saved.append(list(futures)),
+                report_usage=lambda: reported.append(True),
+            ).stop_and_harvest([done, in_flight], interrupted=True)
     finally:
         in_flight.set_result(classify._BatchOutcome({}))
     assert excinfo.value.status == 130
     assert reported == [True]
-    # What finished is stored (harvest is idempotent per future); what is in flight is abandoned.
-    assert list(dict.fromkeys(harvested)) == [done]
+    assert harvested == [done]  # stored while waiting; the abandon then saves whatever is left
+    assert saved == [[done, in_flight]]
     assert "abandoned 1 in-flight request" in capsys.readouterr().err
 
 
@@ -1106,7 +1124,7 @@ def test_results_the_store_rejects_mid_run_are_saved_and_imported_by_the_next_ru
     monkeypatch.setattr(classify, "_BATCH_SIZE", 1)
     monkeypatch.setattr(classify, "_MAX_WORKERS", 1)
     store_path = _store_path(tmp_path)
-    pending_path = classify._pending_path(store_path)
+    pending_dir = classify._pending_dir(store_path)
     items = _items(3)
     good_upsert = classify._UPSERT_SQL
     monkeypatch.setattr(
@@ -1117,8 +1135,8 @@ def test_results_the_store_rejects_mid_run_are_saved_and_imported_by_the_next_ru
     with pytest.raises(AsioDocsError, match="could not write") as excinfo:
         classify.classify(items, client_factory=lambda: client, store_path=store_path)
     assert len(client.calls) == 2  # nothing was sent after the failed write
-    assert str(pending_path) in str(excinfo.value)
-    assert len(pending_path.read_text().splitlines()) == 2
+    assert str(pending_dir) in str(excinfo.value)
+    assert sum(len(path.read_text().splitlines()) for path in pending_dir.glob("*.jsonl")) == 2
     assert classify.stored_keys(store_path) == frozenset()
 
     # The next run imports both, and pays only for the entry that was never classified.
@@ -1127,16 +1145,16 @@ def test_results_the_store_rejects_mid_run_are_saved_and_imported_by_the_next_ru
     classify.classify(items, client_factory=lambda: client2, store_path=store_path)
     assert len(client2.calls) == 1
     assert len(classify.stored_keys(store_path)) == 3
-    assert not pending_path.exists()
+    assert list(pending_dir.iterdir()) == []
 
 
 def test_results_that_cannot_be_saved_anywhere_are_printed(tmp_path, monkeypatch, capsys) -> None:
     store_path = _store_path(tmp_path)
 
     def disk_full(path, rows):
-        raise OSError(28, "No space left on device", str(path))
+        raise OSError(errno.ENOSPC, "No space left on device", str(path))
 
-    monkeypatch.setattr(classify, "_append_pending", disk_full)
+    monkeypatch.setattr(classify, "_save_pending", disk_full)
     monkeypatch.setattr(
         classify, "_UPSERT_SQL", "INSERT INTO no_such_table VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -1164,7 +1182,8 @@ def test_results_that_cannot_be_saved_anywhere_are_printed(tmp_path, monkeypatch
 )
 def test_a_malformed_pending_file_is_rejected_and_kept(tmp_path, line) -> None:
     store_path = _store_path(tmp_path)
-    pending_path = classify._pending_path(store_path)
+    classify._pending_dir(store_path).mkdir()
+    pending_path = classify._pending_dir(store_path) / classify._unique_pending_name()
     pending_path.write_text(line + "\n")
     client = FakeClient([])
     with pytest.raises(AsioDocsError, match="line 1") as excinfo:
@@ -1347,3 +1366,314 @@ def test_the_usage_line_counts_abandoned_reservations_as_possibly_billed() -> No
     line = classify._usage_line(usage)
     assert "20,000 input and 7,168 output tokens possibly billed" in line
     assert usage.cost_usd() == ((5_000 + 20_000) * 2 + (1_000 + 7_168) * 10) / 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# the pending directory
+# ---------------------------------------------------------------------------
+
+
+def _rows(count: int, start: int = 0) -> tuple[classify._StoreRow, ...]:
+    rows = []
+    for i in range(start, start + count):
+        text = f"Pending entry {i}."
+        rows.append(
+            classify._StoreRow(
+                key=classify._cache_key(text),
+                classification=classify.Classification(
+                    category=classify.Category.FIXED,
+                    breaking=False,
+                    breaking_reason="",
+                    model=classify.MODEL,
+                    effort=classify.EFFORT,
+                    release="1.38.0",
+                    classified_at=1_700_000_000.0,
+                ),
+                prompt_version=classify.PROMPT_VERSION,
+                text=text,
+            )
+        )
+    return tuple(rows)
+
+
+def _import(store_path) -> None:
+    conn = classify._connect(store_path)
+    try:
+        classify._import_pending(conn, store_path)
+    finally:
+        conn.close()
+
+
+def _files(directory) -> list[str]:
+    return sorted(path.name for path in directory.iterdir()) if directory.exists() else []
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [OSError(errno.ENOSPC, "No space left on device"), KeyboardInterrupt()],
+    ids=["disk-full", "ctrl-c"],
+)
+def test_a_torn_pending_write_leaves_no_file_and_does_not_block_later_saves(
+    tmp_path, monkeypatch, interruption
+) -> None:
+    store_path = _store_path(tmp_path)
+    classify._connect(store_path).close()
+    real_write_all = classify._write_all
+
+    def torn_write(fd: int, data: bytes) -> None:
+        real_write_all(fd, data[: len(data) // 2])  # half a line reaches the disk
+        raise interruption
+
+    monkeypatch.setattr(classify, "_write_all", torn_write)
+    with pytest.raises(type(interruption)):
+        classify._save_pending(store_path, _rows(2))
+    assert _files(classify._pending_dir(store_path)) == []
+
+    monkeypatch.setattr(classify, "_write_all", real_write_all)
+    classify._save_pending(store_path, _rows(2, start=2))
+    _import(store_path)
+    assert classify.stored_keys(store_path) == {row.key for row in _rows(2, start=2)}
+    assert _files(classify._pending_dir(store_path)) == []
+
+
+def test_a_torn_write_during_a_run_falls_back_to_stderr(tmp_path, monkeypatch, capsys) -> None:
+    store_path = _store_path(tmp_path)
+    monkeypatch.setattr(
+        classify, "_UPSERT_SQL", "INSERT INTO no_such_table VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    def disk_full_midway(fd: int, data: bytes) -> None:
+        os.write(fd, data[:10])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(classify, "_write_all", disk_full_midway)
+    item = _item("Fixed a bug worth keeping.")
+    client = FakeClient([_text_response(_good_items(1))])
+    with pytest.raises(AsioDocsError, match="printed above"):
+        classify.classify([item], client_factory=lambda: client, store_path=store_path)
+    printed = [line for line in capsys.readouterr().err.splitlines() if line.startswith("{")]
+    assert [classify._parse_pending_line(line).key for line in printed] == [classify.cache_key(item.entry)]
+    assert _files(classify._pending_dir(store_path)) == []
+
+
+def test_an_orphaned_temporary_file_is_imported_without_its_torn_tail(tmp_path, capsys) -> None:
+    store_path = _store_path(tmp_path)
+    directory = classify._pending_dir(store_path)
+    directory.mkdir()
+    rows = _rows(3)
+    complete = classify._pending_lines(rows[:2]).encode()
+    torn = classify._pending_lines(rows[2:]).encode()[:25]
+    old_ns = time.time_ns() - 2 * classify._PENDING_ORPHAN_AGE_NS
+    (directory / f".tmp-{old_ns}-1-{'a' * 32}.jsonl").write_bytes(complete + torn)
+    fresh = directory / f".tmp-{classify._unique_pending_name()}"  # a save in progress elsewhere
+    fresh.write_bytes(torn)
+    _import(store_path)
+    assert classify.stored_keys(store_path) == {row.key for row in rows[:2]}
+    assert _files(directory) == [fresh.name]
+    assert "incomplete last line" in capsys.readouterr().err
+
+
+def test_two_writers_and_a_concurrent_import_lose_nothing(tmp_path) -> None:
+    store_path = _store_path(tmp_path)
+    classify._connect(store_path).close()
+    writers_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer(start: int) -> None:
+        try:
+            for i in range(start, start + 60, 3):
+                classify._save_pending(store_path, _rows(3, start=i))
+        except BaseException as e:
+            errors.append(e)
+
+    def importer() -> None:
+        try:
+            while not writers_done.is_set():
+                _import(store_path)
+        except BaseException as e:
+            errors.append(e)
+
+    writers = [threading.Thread(target=writer, args=(start,)) for start in (0, 1_000)]
+    importers = [threading.Thread(target=importer) for _ in range(2)]
+    for thread in writers + importers:
+        thread.start()
+    for thread in writers:
+        thread.join()
+    writers_done.set()
+    for thread in importers:
+        thread.join()
+    _import(store_path)  # whatever the importers had not reached yet
+
+    assert errors == []
+    assert classify.stored_keys(store_path) == {row.key for row in _rows(60) + _rows(60, start=1_000)}
+    assert _files(classify._pending_dir(store_path)) == []
+
+
+@pytest.mark.parametrize(
+    "failure", [AsioDocsError("the store failed"), KeyboardInterrupt()], ids=["store-error", "ctrl-c"]
+)
+def test_an_import_that_fails_partway_leaves_the_rest_importable(tmp_path, monkeypatch, failure) -> None:
+    store_path = _store_path(tmp_path)
+    classify._connect(store_path).close()
+    first = classify._save_pending(store_path, _rows(2))
+    second = classify._save_pending(store_path, _rows(2, start=2))
+    real_upsert = classify._upsert_classifications
+    calls = []
+
+    def failing_second_time(conn, rows, path, **kwargs):
+        calls.append(rows)
+        if len(calls) == 2:
+            raise failure
+        real_upsert(conn, rows, path, **kwargs)
+
+    monkeypatch.setattr(classify, "_upsert_classifications", failing_second_time)
+    with pytest.raises(type(failure)):
+        _import(store_path)
+    assert classify.stored_keys(store_path) == {row.key for row in _rows(2)}
+    assert not first.exists()
+    assert second.exists()  # renamed back from its claimed name, as it was
+
+    monkeypatch.setattr(classify, "_upsert_classifications", real_upsert)
+    _import(store_path)
+    assert classify.stored_keys(store_path) == {row.key for row in _rows(4)}
+    assert _files(classify._pending_dir(store_path)) == []
+
+
+def test_a_claim_left_by_a_dead_import_is_taken_over_but_a_live_one_is_not(tmp_path) -> None:
+    store_path = _store_path(tmp_path)
+    directory = classify._pending_dir(store_path)
+    directory.mkdir()
+    old_ns = time.time_ns() - 2 * classify._PENDING_ORPHAN_AGE_NS
+    dead = directory / f".claimed-{old_ns}-1-{'b' * 32}-{classify._unique_pending_name()}"
+    dead.write_text(classify._pending_lines(_rows(1)))
+    live = directory / f".claimed-{time.time_ns()}-1-{'c' * 32}-{classify._unique_pending_name()}"
+    live.write_text(classify._pending_lines(_rows(1, start=1)))
+    _import(store_path)
+    assert classify.stored_keys(store_path) == {_rows(1)[0].key}
+    assert _files(directory) == [live.name]
+
+
+# ---------------------------------------------------------------------------
+# abandoning a run
+# ---------------------------------------------------------------------------
+
+
+def _finished_batch(item: classify.ClassifyItem, category: str = "fixed") -> Future:
+    future: Future = Future()
+    future.set_result(
+        classify._BatchOutcome(
+            {classify.cache_key(item.entry): classify._RawResult(classify.Category(category), False, "")}
+        )
+    )
+    return future
+
+
+def _harvester(store_path, conn, items, stop, lock_wait_s=lambda: classify._STORE_LOCK_WAIT_S):
+    texts = {classify.cache_key(item.entry): item.entry.full_text() for item in items}
+    releases = {classify.cache_key(item.entry): item.release for item in items}
+    return classify._Harvester(conn, store_path, {}, texts, releases, stop, lock_wait_s)
+
+
+def _hold_store_lock(store_path) -> sqlite3.Connection:
+    other = sqlite3.connect(store_path, timeout=0.0, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    other.execute("PRAGMA user_version = 1")
+    return other
+
+
+def test_abandoning_a_run_never_waits_on_a_locked_store(tmp_path, capsys) -> None:
+    store_path = _store_path(tmp_path)
+    conn = classify._connect(store_path)
+    other = _hold_store_lock(store_path)
+    try:
+        item = _item("Fixed a bug that finished just before the watchdog.")
+        stop = classify._StopFlag()
+        harvest = _harvester(store_path, conn, [item], stop)
+        waiting = classify._Waiting(
+            harvest=harvest,
+            save_for_later=harvest.save_for_later,
+            stop=stop,
+            watchdog_at=time.monotonic(),
+            clock=time.monotonic,
+            progress=lambda: harvest.progress(1),
+            report_usage=lambda: None,
+            exit_process=_fake_exit,
+        )
+        started = time.monotonic()
+        with pytest.raises(_Exited) as excinfo:
+            waiting.abandon([_finished_batch(item)], status=1, message="abandoned by the test")
+        assert time.monotonic() - started < 1.0  # the store's lock wait is 10 s
+    finally:
+        other.rollback()
+        other.close()
+        conn.close()
+    assert excinfo.value.status == 1
+    assert "saved to" in capsys.readouterr().err
+    _import(store_path)  # the next run
+    assert classify.stored_keys(store_path) == {classify.cache_key(item.entry)}
+
+
+def test_a_store_write_near_the_watchdog_does_not_wait_for_the_lock(tmp_path) -> None:
+    store_path = _store_path(tmp_path)
+    conn = classify._connect(store_path)
+    other = _hold_store_lock(store_path)
+    try:
+        item = _item("Fixed a bug harvested at the last moment.")
+        stop = classify._StopFlag()
+        harvest = _harvester(store_path, conn, [item], stop, lock_wait_s=lambda: 0.0)
+        started = time.monotonic()
+        harvest(_finished_batch(item))
+        assert time.monotonic() - started < 1.0
+    finally:
+        other.rollback()
+        other.close()
+        conn.close()
+    assert "locked" in str(stop.reason)
+    assert len(list(classify._pending_dir(store_path).glob("*.jsonl"))) == 1  # saved for the next run
+
+
+def test_ctrl_c_during_abandon_does_not_cut_the_save_short(tmp_path, monkeypatch) -> None:
+    store_path = _store_path(tmp_path)
+    conn = classify._connect(store_path)
+    item = _item("Fixed a bug saved while the user presses Ctrl-C.")
+    real_write_all = classify._write_all
+
+    def interrupted_write(fd: int, data: bytes) -> None:
+        _interrupt_main_thread()
+        time.sleep(0.05)  # the signal arrives while the save is under way
+        real_write_all(fd, data)
+
+    monkeypatch.setattr(classify, "_write_all", interrupted_write)
+    stop = classify._StopFlag()
+    harvest = _harvester(store_path, conn, [item], stop)
+    waiting = _waiting(harvest, save_for_later=harvest.save_for_later, stop=stop)
+    try:
+        with pytest.raises(_Exited) as excinfo:
+            waiting.abandon([_finished_batch(item)], status=130, message=None)
+    finally:
+        conn.close()
+    assert excinfo.value.status == 130
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler  # restored
+    monkeypatch.setattr(classify, "_write_all", real_write_all)
+    _import(store_path)
+    assert classify.stored_keys(store_path) == {classify.cache_key(item.entry)}
+
+
+# ---------------------------------------------------------------------------
+# a response billed for more than its reservation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+def test_usage_over_a_reservation_stops_the_run_and_keeps_the_result(tmp_path, monkeypatch, kind) -> None:
+    monkeypatch.setattr(classify, "_BATCH_SIZE", 1)
+    monkeypatch.setattr(classify, "_MAX_WORKERS", 1)
+    store_path = _store_path(tmp_path)
+    items = _items(2)
+    over = _usage(10**7, 5) if kind == "input" else _usage(10, classify._max_tokens_for(1) + 1)
+    client = FakeClient([_text_response(_good_items(1), usage=over), _text_response(_good_items(1))])
+    with pytest.raises(AsioDocsError, match=f"billed [0-9,]+ {kind} tokens .* bound was [0-9,]+") as excinfo:
+        classify.classify(items, client_factory=lambda: client, store_path=store_path)
+    assert len(client.calls) == 1  # the second batch was never sent
+    assert classify.stored_keys(store_path) == {classify.cache_key(items[0].entry)}
+    assert "1 of 2 entries" in str(excinfo.value)
