@@ -183,6 +183,55 @@ def test_install_tree_rolls_back_a_failed_swap_and_keeps_the_old_tree_complete(
     assert not list(tmp_path.glob("cache/asio-doc-tools/docs/.asio-*-old-*"))
 
 
+def test_stale_swap_dirs_from_a_killed_run_are_swept_on_the_next_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tarball = tmp_path / "asio.tar.bz2"
+    _make_tarball(tarball, VERSION, members=_minimal_doc_members())
+    body = tarball.read_bytes()
+    monkeypatch.setattr(net, "fetch", lambda url, *, validate=None, **kwargs: body)
+
+    ensure_doc_tree(VERSION, source="tarball")
+
+    # A SIGKILLed run leaves its swap directories behind (nothing catches a kill
+    # signal to clean up); simulate that directly rather than trying to actually
+    # kill a subprocess mid-swap.
+    docs_dir = tmp_path / "cache" / "asio-doc-tools" / "docs"
+    leftover_new = docs_dir / f".asio-{VERSION}-new-leftover"
+    leftover_old = docs_dir / f".asio-{VERSION}-old-99999"
+    (leftover_new / "doc").mkdir(parents=True)
+    (leftover_new / "doc" / "junk.html").write_text("junk")
+    (leftover_old / "doc").mkdir(parents=True)
+    (leftover_old / "doc" / "junk.html").write_text("junk")
+
+    ensure_doc_tree(VERSION, source="tarball", refresh=True)
+
+    assert not leftover_new.exists()
+    assert not leftover_old.exists()
+
+
+def test_extraction_io_error_is_reported_distinctly_from_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tarball = tmp_path / "asio.tar.bz2"
+    _make_tarball(tarball, VERSION, members=_minimal_doc_members())
+    body = tarball.read_bytes()
+    monkeypatch.setattr(net, "fetch", lambda url, *, validate=None, **kwargs: body)
+
+    def failing_extractall(self: tarfile.TarFile, *args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")  # ENOSPC, not a corrupt archive
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", failing_extractall)
+
+    with pytest.raises(AsioDocsError) as excinfo:
+        ensure_doc_tree(VERSION, source="tarball")
+
+    message = str(excinfo.value)
+    assert "No space left on device" in message
+    assert "corrupt" not in message.lower()
+    assert "truncated" not in message.lower()
+
+
 class _DocTreeHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass

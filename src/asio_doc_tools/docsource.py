@@ -59,6 +59,22 @@ def _check_required_files(doc_dir: Path, *, how: str) -> None:
         )
 
 
+def _sweep_stale_temp_dirs(version: Version) -> None:
+    """Removes leftover swap directories from a run that never reached its own cleanup.
+
+    A `.asio-{version}-new-*` or `.asio-{version}-old-*` directory only outlives
+    `_install_tree` when something kills the process outright (SIGKILL, a host
+    crash) rather than raising an exception it can catch and clean up after; ties
+    them to `version` so this never touches another version's in-progress swap.
+    """
+    cache_docs_dir = _tree_dir(version).parent
+    if not cache_docs_dir.is_dir():
+        return
+    for pattern in (f".asio-{version}-new-*", f".asio-{version}-old-*"):
+        for stale in cache_docs_dir.glob(pattern):
+            shutil.rmtree(stale, ignore_errors=True)
+
+
 def _install_tree(version: Version, populate: Callable[[Path], None], *, how: str) -> Path:
     """Populate a fresh temp dir under the cache, then swap it into place atomically.
 
@@ -67,16 +83,24 @@ def _install_tree(version: Version, populate: Callable[[Path], None], *, how: st
     touched until the populated tree is verified and ready to become permanent.
 
     The swap itself: the marker is removed first (so a tree without one is never
-    mistaken for complete), the old tree (if any) is renamed aside rather than
-    deleted, the new tree is renamed into the old tree's place, the marker is
-    written, and only then is the old tree actually removed. If the process is
-    interrupted anywhere in that sequence, what is left is either the untouched
-    old tree with no marker (so the next call redoes the work) or the new tree
-    with its marker (fully installed); there is no state in between that looks
-    complete.
+    mistaken for complete); if a previous tree exists it is renamed aside rather
+    than deleted, then the new tree is renamed into its place, and the marker is
+    written last, before the set-aside old tree is finally removed. An ordinary
+    exception during any of this (including a failure of the final rename) is
+    caught and rolled back: the old tree and its marker, if they were touched,
+    are put back exactly as they were. A `KeyboardInterrupt` (or anything else
+    this function is not explicitly prepared for) is a different story: if it
+    lands after the old tree has been renamed aside but before the new tree has
+    been renamed into place, this function's own `finally` block removes both
+    the new tree (an incomplete attempt) and the set-aside old tree on its way
+    out, so `tree_dir` ends up empty rather than holding either one. That is
+    still safe in the sense that nothing incomplete is ever left looking
+    complete, but it does mean a previously good tree can be lost to a signal
+    landing in that narrow window, and the next call rebuilds from scratch.
     """
     tree_dir = _tree_dir(version)
     tree_dir.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_temp_dirs(version)
     tmp = Path(tempfile.mkdtemp(dir=tree_dir.parent, prefix=f".asio-{version}-new-"))
     old_aside = tree_dir.parent / f".asio-{version}-old-{os.getpid()}"
     marker = _marker(version)
@@ -132,12 +156,18 @@ def _extract_doc_tree(archive_path: Path, version: Version, doc_tmp: Path) -> No
                     f"tarball for asio-{version} contains a member outside its 'doc/' tree ({e}); "
                     "refusing to extract it."
                 ) from e
-    except (tarfile.ReadError, EOFError, OSError) as e:
+    except (tarfile.ReadError, EOFError) as e:
         # A mirror that truncates the download, or answers with a corrupt file that
         # still happens to start with the bzip2 magic. Reported the same way as any
         # other tarball problem, so "auto" falls back to crawling instead of a raw
         # traceback from deep inside tarfile.
         raise AsioDocsError(f"tarball for asio-{version} at {archive_path} is corrupt or truncated: {e}") from e
+    except OSError as e:
+        # Distinct from the corruption case above: this is the local disk or
+        # permissions (out of space, no write access to the cache, ...), not a
+        # problem with the tarball's contents, so it gets its own accurate message
+        # rather than being folded into "corrupt or truncated".
+        raise AsioDocsError(f"could not extract the tarball for asio-{version} at {archive_path}: {e}") from e
 
 
 def _fetch_tarball(version: Version) -> Path | None:

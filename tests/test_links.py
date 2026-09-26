@@ -29,6 +29,11 @@ def test_recognizes_bare_external_hosts(href: str) -> None:
         "./sibling.html",
         "",
         "reference.html#fragment",
+        # A fragment or query string can itself contain a "/"; that must never be
+        # mistaken for more path when only one real path segment is present.
+        "reference.html#a/b",
+        "reference.html?x=a/b",
+        "asio/reference.html#a/b/c",
     ],
 )
 def test_does_not_flag_ordinary_in_tree_links(href: str) -> None:
@@ -39,3 +44,8 @@ def test_external_url_drops_the_navigation_prefix() -> None:
     assert external_url("www.open-std.org/jtc1/n4370.html") == "http://www.open-std.org/jtc1/n4370.html"
     assert external_url("../www.open-std.org/jtc1/n4370.html") == "http://www.open-std.org/jtc1/n4370.html"
     assert external_url("../../www.open-std.org/path.html") == "http://www.open-std.org/path.html"
+
+
+def test_external_url_keeps_query_and_fragment() -> None:
+    assert external_url("www.example.com/path.html?x=1") == "http://www.example.com/path.html?x=1"
+    assert external_url("www.example.com/path.html#frag") == "http://www.example.com/path.html#frag"

@@ -96,6 +96,11 @@ def _run_status(args: argparse.Namespace) -> int:
         when = time.ctime(result.installed_at)
         breakdown = ", ".join(f"{count} in {section}" for section, count in result.count_by_section)
         print(f"asio-{result.version} installed into {result.man_dir} on {when} ({breakdown}).")
+        if result.incomplete:
+            print(
+                f"  the last install into {result.man_dir} did not finish; "
+                f"rerun `asio-docs man install --man-dir {result.man_dir}`."
+            )
     return 0
 
 

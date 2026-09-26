@@ -14,11 +14,13 @@ to fetch the host as one of its own pages) and the man page generator
 resolving to a bogus in-tree path) rely on this same rule.
 """
 
+from urllib.parse import urlsplit
+
 _NAVIGATION_SEGMENTS = (".", "..")
 
 
-def _skip_navigation_prefix(href: str) -> list[str]:
-    segments = href.split("/")
+def _skip_navigation_prefix(path: str) -> list[str]:
+    segments = path.split("/")
     start = 0
     while start < len(segments) and segments[start] in _NAVIGATION_SEGMENTS:
         start += 1
@@ -27,8 +29,13 @@ def _skip_navigation_prefix(href: str) -> list[str]:
 
 def is_bare_external_host(href: str) -> bool:
     """True if `href` is a same-site-looking relative link that is really an
-    external host with its scheme missing (see the module docstring)."""
-    remaining = _skip_navigation_prefix(href)
+    external host with its scheme missing (see the module docstring).
+
+    Only the path portion is inspected: a fragment or query string can itself
+    contain a "/" (e.g. "reference.html#a/b"), and must not be mistaken for
+    more path when deciding whether the first segment is a host name.
+    """
+    remaining = _skip_navigation_prefix(urlsplit(href).path)
     if len(remaining) < 2:
         return False  # nothing follows the navigation prefix, or it's the last segment
     host_candidate = remaining[0]
@@ -40,6 +47,12 @@ def external_url(href: str) -> str:
 
     Any leading "." / ".." navigation segments are dropped first: they are an
     artifact of how the source page embedded the link, not part of the host or
-    path being linked to.
+    path being linked to. A query string or fragment, if present, is kept.
     """
-    return "http://" + "/".join(_skip_navigation_prefix(href))
+    parts = urlsplit(href)
+    rebuilt = "/".join(_skip_navigation_prefix(parts.path))
+    if parts.query:
+        rebuilt += "?" + parts.query
+    if parts.fragment:
+        rebuilt += "#" + parts.fragment
+    return "http://" + rebuilt

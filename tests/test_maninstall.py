@@ -1,6 +1,7 @@
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -267,6 +268,90 @@ def test_install_interrupted_after_intent_record_then_reinstalled(tmp_path: Path
     assert (man_dir / "man3" / "asio.new.3asio.gz").is_file()
     assert not (man_dir / "man3" / "asio.old.3asio.gz").exists()
     assert report.removed == 1  # asio.old was stale relative to the final page set
+
+
+def test_install_saves_an_incomplete_intent_record_before_writing_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    man_dir = tmp_path / "man"
+    maninstall.install((_page("asio.old"),), man_dir, version=V1)
+
+    def boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("simulated crash mid-install")
+
+    monkeypatch.setattr(maninstall, "write_tree", boom)
+
+    with pytest.raises(RuntimeError):
+        maninstall.install((_page("asio.new"),), man_dir, version=V2)
+
+    # The intent record on disk must not claim the new version is installed: the
+    # old version is still what is actually there, and `incomplete` says so.
+    manifest = _manifest(tmp_path)
+    key = str(man_dir.resolve())
+    assert manifest[key]["incomplete"] is True
+    assert manifest[key]["version"] == str(V1)
+
+    results = maninstall.status()
+    assert len(results) == 1
+    assert results[0].incomplete
+    assert results[0].version == V1
+
+
+def test_status_is_not_incomplete_after_a_normal_install(tmp_path: Path) -> None:
+    man_dir = tmp_path / "man"
+    maninstall.install((_page("asio.a"),), man_dir, version=V1)
+
+    results = maninstall.status()
+
+    assert len(results) == 1
+    assert not results[0].incomplete
+
+
+# -- symlink safety in stale removal / uninstall ---------------------------------
+
+
+def test_stale_removal_unlinks_a_symlinked_page_without_touching_its_target(tmp_path: Path) -> None:
+    man_dir = tmp_path / "man"
+    maninstall.install((_page("asio.old"),), man_dir, version=V1)
+
+    # Replace the installed (stale-to-be) page with a symlink to some unrelated
+    # file, simulating tampering between install and the next install's cleanup.
+    stale_path = man_dir / "man3" / "asio.old.3asio.gz"
+    target = tmp_path / "external-target.txt"
+    target.write_text("do not touch")
+    stale_path.unlink()
+    stale_path.symlink_to(target)
+
+    report = maninstall.install((_page("asio.new"),), man_dir, version=V2)
+
+    assert report.removed == 1
+    assert not stale_path.exists()
+    assert not stale_path.is_symlink()  # the symlink itself is gone
+    assert target.read_text() == "do not touch"  # unlink() never followed it
+
+
+def test_uninstall_refuses_to_delete_through_a_symlinked_section_dir(tmp_path: Path) -> None:
+    man_dir = tmp_path / "man"
+    maninstall.install((_page("asio.a"),), man_dir, version=V1)
+
+    # Replace man3 itself with a symlink to a directory that happens to hold a
+    # file with the same name, simulating man_dir being tampered with after
+    # install. Deleting "through" that symlink would remove a file that is not
+    # actually inside man_dir at all.
+    real_man3 = man_dir / "man3"
+    outside = tmp_path / "outside-man3"
+    shutil.copytree(real_man3, outside)
+    shutil.rmtree(real_man3)
+    real_man3.symlink_to(outside)
+
+    with pytest.raises(AsioDocsError):
+        maninstall.uninstall(man_dir)
+
+    # Nothing was deleted through the symlink, and the record is still there:
+    # this call refused outright rather than removing what it safely could.
+    assert (outside / "asio.a.3asio.gz").is_file()
+    manifest = _manifest(tmp_path)
+    assert str(man_dir.resolve()) in manifest
 
 
 # -- manifest validation ---------------------------------------------------------

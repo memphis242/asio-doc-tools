@@ -81,9 +81,22 @@ class _Record:
     version: Version
     installed_at: float
     paths: tuple[str, ...]
+    # True only for the intent record install() saves before it has actually
+    # written anything: if the process dies before the matching final record
+    # replaces it, `paths` may list files that were never written (or, on a
+    # reinstall, not yet removed), so `version` is not to be trusted as
+    # "installed" until this is False again.
+    incomplete: bool = False
 
     def to_json(self) -> dict[str, object]:
-        return {"version": str(self.version), "installed_at": self.installed_at, "paths": list(self.paths)}
+        data: dict[str, object] = {
+            "version": str(self.version),
+            "installed_at": self.installed_at,
+            "paths": list(self.paths),
+        }
+        if self.incomplete:
+            data["incomplete"] = True
+        return data
 
 
 def _invalid(manifest_path: Path, reason: str) -> AsioDocsError:
@@ -109,8 +122,11 @@ def _record_from_json(data: object, *, manifest_path: Path, man_dir: str) -> _Re
         raise _invalid(manifest_path, f"'{man_dir}' is missing field {e}") from e
     except (TypeError, ValueError) as e:
         raise _invalid(manifest_path, f"'{man_dir}' has an invalid version or timestamp ({e})") from e
+    incomplete = data.get("incomplete", False)
+    if not isinstance(incomplete, bool):
+        raise _invalid(manifest_path, f"'{man_dir}'.incomplete must be a boolean")
     paths_field = _validate_paths(data.get("paths"), manifest_path=manifest_path, man_dir=man_dir)
-    return _Record(version=version, installed_at=installed_at, paths=paths_field)
+    return _Record(version=version, installed_at=installed_at, paths=paths_field, incomplete=incomplete)
 
 
 def _load_manifest() -> dict[str, _Record]:
@@ -166,12 +182,30 @@ def _effective_manpath() -> tuple[Path, ...]:
 def _remove_listed(man_dir: Path, relative_paths: Sequence[str]) -> int:
     removed = 0
     for relative in relative_paths:
-        candidate = man_dir / relative
         # `relative` was already checked by _validate_paths (or, for a record built
-        # in this call, is one of our own filenames); this is the last-resort check
-        # on that invariant before anything is unlinked.
-        assert candidate.resolve().is_relative_to(man_dir), candidate
-        if candidate.is_file():
+        # in this call, is one of our own freshly built filenames): no ".." or
+        # empty segment and no leading "/". That is a plain internal invariant
+        # about a string this program built or already validated, so it is fine
+        # to assert on lexically, without touching the filesystem or following
+        # any symlink (contrast with the containment check below, which is about
+        # filesystem state neither the manifest nor this call controls).
+        parts = Path(relative).parts
+        assert ".." not in parts and not Path(relative).is_absolute(), relative
+        candidate = man_dir / relative
+        section_dir = candidate.parent
+        if section_dir.is_symlink():
+            # The section directory (man3, man7, ...) is external filesystem
+            # state: it could have been swapped for a symlink by something else
+            # since it was created. Deleting "through" it could remove a file
+            # outside man_dir entirely, so this is a real check, not an assert,
+            # and it refuses rather than silently resolving and deleting anyway.
+            raise AsioDocsError(
+                f"refusing to remove pages under {section_dir}: it is a symlink, not a real "
+                "directory. Remove it manually (or replace it with a real directory) and retry."
+            )
+        # candidate itself may be a symlink; unlink() removes the symlink entry
+        # without following it, so whatever it points at is never touched.
+        if candidate.is_symlink() or candidate.is_file():
             candidate.unlink()
             removed += 1
     return removed
@@ -209,8 +243,12 @@ def install(
     # what is about to be written. If the process is interrupted after this point,
     # every file on disk that could plausibly need cleaning up is still listed by
     # some record, so a later install or uninstall never loses track of a page.
+    # The version stays whatever was actually installed before (or, for a first
+    # install, the new one, since there is nothing else to report); `incomplete`
+    # is what tells `status` this record does not yet describe a finished install.
     intent_paths = tuple(sorted(previously_known | set(new_relative)))
-    records[key] = _Record(version=version, installed_at=time.time(), paths=intent_paths)
+    intent_version = previous.version if previous is not None else version
+    records[key] = _Record(version=intent_version, installed_at=time.time(), paths=intent_paths, incomplete=True)
     _save_manifest(records)
 
     written = write_tree(pages, man_dir, compress=True)
@@ -285,6 +323,11 @@ class Status:
     version: Version
     installed_at: float
     count_by_section: tuple[tuple[str, int], ...]
+    # True when the last install into this man_dir was interrupted before it
+    # finished: `version` and `count_by_section` describe the last state install()
+    # meant to reach, not necessarily what is actually on disk right now. Rerunning
+    # `asio-docs man install` resolves it.
+    incomplete: bool = False
 
 
 def status() -> tuple[Status, ...]:
@@ -302,6 +345,7 @@ def status() -> tuple[Status, ...]:
                 version=record.version,
                 installed_at=record.installed_at,
                 count_by_section=tuple(sorted(counts.items())),
+                incomplete=record.incomplete,
             )
         )
     return tuple(result)
