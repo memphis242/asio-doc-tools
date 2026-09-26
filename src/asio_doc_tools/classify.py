@@ -15,7 +15,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -601,8 +601,32 @@ def classify(
             completed_batches = cancelled_batches = 0
             first_error: AsioDocsError | None = None
 
+            def store_outcome(outcome: _BatchOutcome) -> None:
+                nonlocal completed_batches, total_input, total_output
+                completed_batches += 1
+                total_input += outcome.input_tokens
+                total_output += outcome.output_tokens
+                if not outcome.classified:
+                    return
+                classified_at = time.time()
+                rows: list[tuple[str, Classification, str]] = []
+                for key, result in outcome.classified.items():
+                    classification = Classification(
+                        category=result.category,
+                        breaking=result.breaking,
+                        breaking_reason=result.breaking_reason,
+                        model=MODEL,
+                        effort=EFFORT,
+                        release=str(release_by_key[key]),
+                        classified_at=classified_at,
+                    )
+                    store[key] = classification
+                    rows.append((key, classification, unique_texts[key]))
+                _upsert_classifications(conn, rows)
+
             pool = ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(batches)))
             futures = [pool.submit(_classify_batch, client, batch, unique_texts) for batch in batches]
+            stored: set[Future[_BatchOutcome]] = set()
             try:
                 for future in as_completed(futures):
                     try:
@@ -610,27 +634,8 @@ def classify(
                     except CancelledError:
                         cancelled_batches += 1
                         continue
-
-                    completed_batches += 1
-                    total_input += outcome.input_tokens
-                    total_output += outcome.output_tokens
-
-                    if outcome.classified:
-                        classified_at = time.time()
-                        rows: list[tuple[str, Classification, str]] = []
-                        for key, result in outcome.classified.items():
-                            classification = Classification(
-                                category=result.category,
-                                breaking=result.breaking,
-                                breaking_reason=result.breaking_reason,
-                                model=MODEL,
-                                effort=EFFORT,
-                                release=str(release_by_key[key]),
-                                classified_at=classified_at,
-                            )
-                            store[key] = classification
-                            rows.append((key, classification, unique_texts[key]))
-                        _upsert_classifications(conn, rows)
+                    store_outcome(outcome)
+                    stored.add(future)
 
                     if outcome.error is not None and first_error is None:
                         first_error = outcome.error
@@ -641,10 +646,20 @@ def classify(
                             if not pending.done():
                                 pending.cancel()
             except BaseException:
-                # A KeyboardInterrupt (or any bug) surfacing out of future.result() rather
-                # than as `.error`: stop taking on new work and do not wait for what is
-                # already running, so the interrupt is not swallowed by a blocking shutdown.
+                # A KeyboardInterrupt (or any bug) surfacing out of future.result() or the
+                # wait itself: stop taking on new work and do not wait for what is still
+                # running, so the interrupt is not swallowed by a blocking shutdown. Batches
+                # that already finished are paid for, so store them first; as_completed may
+                # not have yielded them yet when several finish together.
                 pool.shutdown(wait=False, cancel_futures=True)
+                for finished in futures:
+                    if (
+                        finished not in stored
+                        and finished.done()
+                        and not finished.cancelled()
+                        and finished.exception() is None
+                    ):
+                        store_outcome(finished.result())
                 raise
             else:
                 pool.shutdown(wait=True)
