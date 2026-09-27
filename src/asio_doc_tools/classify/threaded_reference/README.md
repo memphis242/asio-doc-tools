@@ -44,8 +44,10 @@ drives the same `batch.classify_batch` generator, one with a blocking
 | First Ctrl-C | `KeyboardInterrupt` on the main thread; queued futures are cancelled, in-flight ones waited for and stored | a `loop.add_signal_handler` callback; tasks waiting for a slot are cancelled, in-flight ones waited for and stored |
 | Second Ctrl-C | a thread blocked in a socket read cannot be interrupted, so it saves every finished result to the pending directory (with Ctrl-C ignored meanwhile), reports usage, and calls `os._exit(130)`, skipping every `finally` | cancels every task: each request's connection closes within milliseconds, finished results are stored normally, and the run raises `KeyboardInterrupt` (130) with every `finally` run |
 | Hard limit (560 s) | the main thread's waits time out; it abandons the run as above and calls `os._exit(1)` | a `loop.call_at` timer cancels every task; the run raises `AsioDocsError` (status 1) |
+| Teardown after stopping | nothing to wait for: `os._exit` ends the process | bounded: the loop's helper jobs (DNS lookups, the SDK's platform detection) run on daemon threads, waited on for at most 2 s, and a thread the run started that is still alive 4 s after the batches ended makes it flush its output and exit the process (same status) |
+| An unexpected exception in one batch | the main thread harvests every other batch, then raises it | the batch's task keeps it (tasks raise nothing but `CancelledError`), so the TaskGroup never cancels the others; raised once every batch has ended |
 | Requests given up on | keep running until the process exits: the server completes them and bills them | closed at once; counted as possibly billed, since cancelling does not un-bill what was generated |
-| Threads | 32 workers plus the main thread | the main thread, plus the SDK's brief platform-detection thread |
+| Threads | 32 workers plus the main thread | the main thread, plus short-lived daemon threads for DNS lookups and the SDK's platform detection |
 
 Performance is not the difference. At this workload both are limited by the model's
 latency (seconds per request) and spend milliseconds of client CPU per request, so they

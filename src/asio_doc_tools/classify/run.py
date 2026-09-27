@@ -72,8 +72,8 @@ class UsageReport:
 
     def __call__(self) -> None:
         if not self._printed:
-            self._printed = True
             spend(budget.usage_line(self._budget.usage()))
+            self._printed = True  # only once printed: an interrupt midway leaves it to print again
 
 
 def waiting_line(in_flight: int, *, interrupted: bool) -> str:

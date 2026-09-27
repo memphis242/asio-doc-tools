@@ -106,7 +106,11 @@ from .prompt import EFFORT, MODEL, SCHEMA, SYSTEM_PROMPT
 # store write waits for another process's lock only until it, and past it the asyncio
 # engine cancels what is in flight (its connections close within milliseconds) while
 # the threaded reference writes one pending file and exits the process, since a thread
-# blocked in a socket read cannot be interrupted.
+# blocked in a socket read cannot be interrupted. The asyncio engine's teardown is
+# bounded as well: its only helper threads (DNS lookups, the SDK's platform detection)
+# are daemon threads it waits on for at most 2 s, and a thread the run started that is
+# still alive 4 s after its batches ended makes it exit the process, after storing and
+# reporting. So a run ends within about 565 s, whatever hangs.
 #
 # Stopping. The first error, cap refusal, store-write failure, or Ctrl-C sets the run's
 # stop flag, which every attempt checks first: from then on no request is sent, only the

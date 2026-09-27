@@ -6,7 +6,7 @@ import classify_support as cs
 import httpx
 import pytest
 
-from asio_doc_tools.classify import batch, budget, prompt, retry
+from asio_doc_tools.classify import batch, budget, prompt, retry, run
 from asio_doc_tools.diag import AsioDocsError
 
 
@@ -346,3 +346,20 @@ def test_the_usage_line_counts_abandoned_reservations_as_possibly_billed() -> No
     line = budget.usage_line(usage)
     assert "20,000 input and 7,168 output tokens possibly billed" in line
     assert usage.cost_usd() == ((5_000 + 20_000) * 2 + (1_000 + 7_168) * 10) / 1_000_000
+
+
+def test_the_usage_report_prints_again_when_an_interrupt_cut_it_short(monkeypatch) -> None:
+    report = run.UsageReport(run_budget())
+    printed: list[str] = []
+
+    def spend_interrupted_once(message: str) -> None:
+        printed.append(message)
+        if len(printed) == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(run, "spend", spend_interrupted_once)
+    with pytest.raises(KeyboardInterrupt):
+        report()
+    report()
+    report()
+    assert len(printed) == 2  # the interrupted print, then the one that got through, once

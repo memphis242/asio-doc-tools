@@ -629,8 +629,40 @@ class Recorder:
         assert threading.get_ident() == self._owner
         if classified:
             self._store_rows(self._rows(classified))
-        if failure is not None and self._first_failure is None:
+        if failure is not None:
+            self.keep_failure(failure)
+
+    def keep_failure(self, failure: BaseException) -> None:
+        """Keeps `failure`, an unexpected exception, if it is the run's first."""
+        if self._first_failure is None:
             self._first_failure = failure
+
+    def salvage(self, classified: Mapping[str, RawResult]) -> None:
+        """For results `record` failed on with an unexpected exception: saves them to the
+        pending directory without touching the store, or, if even that fails, prints them
+        to stderr as JSON lines, with only the fields recording would have used."""
+        assert threading.get_ident() == self._owner
+        try:
+            self.save_for_later((classified,))
+        except Exception as e:
+            lines = "\n".join(
+                json.dumps(
+                    {
+                        "key": key,
+                        "category": result.category.value,
+                        "breaking": result.breaking,
+                        "breaking_reason": result.breaking_reason,
+                        "text": self._texts.get(key),
+                    },
+                    ensure_ascii=False,
+                )
+                for key, result in classified.items()
+            )
+            warn(
+                f"could not save {quantity(len(classified), 'paid-for classification')} anywhere ({e!r}); "
+                f"here they are as JSON lines:\n{lines}"
+            )
+            self._printed += len(classified)
 
     def save_for_later(self, results: Sequence[Mapping[str, RawResult]]) -> None:
         """For a run being abandoned: saves `results` to the pending directory, without

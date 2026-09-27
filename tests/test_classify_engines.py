@@ -487,3 +487,39 @@ def test_how_a_run_ends_becomes_the_exit_status(monkeypatch, raised, status) -> 
     monkeypatch.setattr(notesdiff, "build_diff_result", build_diff_result)
     assert cli.main(["diff", "1.38.1", "1.38.2", "--engine", "threads"]) == status
     assert cli.main(["diff", "1.38.1", "1.38.2"]) == status
+
+
+def _pending_keys(path) -> set[str]:
+    directory = store.pending_dir(path)
+    return {
+        store.parse_pending_line(line).key
+        for file in (directory.glob("*.jsonl") if directory.exists() else ())
+        for line in file.read_text().splitlines()
+    }
+
+
+def test_an_unexpected_exception_while_recording_keeps_every_paid_result(
+    engine, tmp_path, monkeypatch
+) -> None:
+    # Three requests in flight at once; recording the first one to finish raises. The
+    # other two still finish and are stored, the failed one is kept for the next run, and
+    # the exception itself is what the run raises.
+    _one_per_batch(monkeypatch, 3)
+    real_record = store.Recorder.record
+    failures: list[bool] = []
+
+    def record_failing_once(self, classified, failure):
+        if not failures:
+            failures.append(True)
+            raise RuntimeError("recording failed")
+        real_record(self, classified, failure)
+
+    monkeypatch.setattr(store.Recorder, "record", record_failing_once)
+    path = cs.store_path(tmp_path)
+    three = cs.items(3)
+    result, client = engine.run(three, [WaitForCalls(3, cs.good_response())] * 3, path)
+    assert isinstance(result, RuntimeError) and str(result) == "recording failed"
+    assert len(client.calls) == 3
+    assert set(classify.stored_keys(path)) | _pending_keys(path) == cs.keys_of(three)
+    rerun, client = engine.run(three, [], path)  # the next run pays for nothing
+    assert len(rerun) == 3 and client.calls == []
