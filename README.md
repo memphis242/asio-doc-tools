@@ -61,6 +61,7 @@ not write.
 asio-docs diff 1.30.2 1.38.2                   # grouped: breaking, deprecated, added, changed, fixed, other
 asio-docs diff 1.30.2 latest --format markdown # or --format json
 asio-docs releases                             # all releases, entry counts, classification coverage
+asio-docs diff 1.30.2 1.38.2 --engine threads  # the threaded reference engine (same results)
 ```
 
 The diff covers every release after the older version up to and including the
@@ -75,17 +76,29 @@ bullet is only ever sent once: repeated diffs are instant, free, and stable.
 Stored answers are keyed by prompt version, model, and effort, so a change to
 any of them re-classifies automatically.
 
+Bullets go 40 to a request, with up to 32 requests in flight at once, so even
+the full history takes one round of requests.
+
 Spending is hard-capped per run. Before its first request, a run prints how many
 requests it expects, the expected cost, and its hard caps on requests, output
 and input tokens, and time, with the most it can possibly cost. It prints actual
 usage when it finishes, even with `-q`. For the full history (about 1,000
-bullets) the expected cost is about $0.55 and the worst case $3.88; a run whose
-worst case would pass $5.00 is refused before anything is sent (diff a smaller
+bullets) the expected cost is about $0.55 and the worst case $5.09; a run whose
+worst case would pass $6.00 is refused before anything is sent (diff a smaller
 range first: its answers carry over). Nothing is sent either when the
 classification store cannot be written. When a cap is hit, the run stops and
 keeps everything classified so far. Rerunning sends only what is still missing.
 The first Ctrl-C waits for in-flight requests and stores their answers; a second
-exits at once, and so does a run still waiting after about 9 minutes.
+gives up on them at once, and so does a run still going after about 9 minutes.
+
+Requests run on one asyncio event loop by default. `--engine threads` runs them on a
+thread pool instead, through a reference implementation kept to compare the two
+(see [its README](src/asio_doc_tools/classify/threaded_reference/README.md)). Both
+engines give the same results and store them in the same place, and they have the
+same costs and limits. asyncio is the default for its cleaner cancellation and
+deadlines, not for speed: at this scale the two are equally fast
+([bench/RESULTS.md](bench/RESULTS.md),
+[bench/THREADS-VS-EVENT-LOOP.md](bench/THREADS-VS-EVENT-LOOP.md)).
 
 ## Files
 

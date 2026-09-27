@@ -1,9 +1,9 @@
 import inspect
 import json
 import time
-from types import SimpleNamespace
 
 import pytest
+from classify_support import Echo, scripted_client
 
 from asio_doc_tools import classify, cli, notesdiff
 from asio_doc_tools.diag import AsioDocsError
@@ -90,34 +90,30 @@ def test_reclassify_is_gone() -> None:
     assert "reclassify" not in inspect.signature(classify.classify).parameters
 
 
-def test_build_diff_result_classifies_only_entries_not_yet_stored(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("engine", classify.ENGINES)
+def test_build_diff_result_classifies_only_entries_not_yet_stored(monkeypatch, tmp_path, engine) -> None:
     _fake_fetch_history(monkeypatch)
     store_path = tmp_path / "classifications.sqlite3"
-    calls: list[dict] = []
-
-    def create(**kwargs):
-        calls.append(kwargs)
-        ids = [item["id"] for item in json.loads(kwargs["messages"][0]["content"])["items"]]
-        items = [{"id": i, "category": "fixed", "breaking": False, "breaking_reason": ""} for i in ids]
-        return SimpleNamespace(
-            stop_reason="end_turn",
-            content=[SimpleNamespace(type="text", text=json.dumps({"items": items}))],
-            usage=SimpleNamespace(input_tokens=100, output_tokens=10),
-            stop_details=None,
-        )
-
-    client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    client = scripted_client(engine, [Echo(), Echo()])
     first = notesdiff.build_diff_result(
-        "1.38.1", "1.38.2", client_factory=lambda: client, store_path=store_path
+        "1.38.1", "1.38.2", engine=engine, client_factory=lambda: client, store_path=store_path
     )
     assert first.entry_count == 2
-    assert len(calls) == 1
+    assert len(client.calls) == 1
     wider = notesdiff.build_diff_result(
-        "1.38.0", "1.38.2", client_factory=lambda: client, store_path=store_path
+        "1.38.0", "1.38.2", engine=engine, client_factory=lambda: client, store_path=store_path
     )
     assert wider.entry_count == 3
-    assert len(calls) == 2
-    assert len(json.loads(calls[1]["messages"][0]["content"])["items"]) == 1  # only the new entry
+    assert len(client.calls) == 2
+    assert len(json.loads(client.calls[1]["messages"][0]["content"])["items"]) == 1  # only the new entry
+
+
+def test_the_engine_is_chosen_on_the_command_line_and_defaults_to_asyncio() -> None:
+    parser = cli.build_parser()
+    assert parser.parse_args(["diff", "1.38.0", "1.38.2"]).engine == "asyncio" == classify.DEFAULT_ENGINE
+    assert parser.parse_args(["diff", "1.38.0", "1.38.2", "--engine", "threads"]).engine == "threads"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["diff", "1.38.0", "1.38.2", "--engine", "fibers"])
 
 
 # ---------------------------------------------------------------------------
