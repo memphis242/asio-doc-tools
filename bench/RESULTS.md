@@ -6,7 +6,9 @@ standard build, GIL enabled), anthropic 0.102.0 on httpx 0.28.1 / httpcore
 1.0.9, uvloop 0.22.1. Other desktop work ran at the same time (see
 [Noise](#noise-and-outliers)). Local cells ran 3 times each, and the tables show
 the median with the range; the live scenarios ran once. Method and definitions
-are in [README.md](README.md).
+are in [README.md](README.md). Why blocking threads kept pace with the event
+loop, and where and why they stopped, is worked through in
+[THREADS-VS-EVENT-LOOP.md](THREADS-VS-EVENT-LOOP.md).
 
 Live spend: **$0.5534** of the $1.00 cap (768 requests, all successful; the
 worst-case plan was $0.9779).
@@ -123,8 +125,9 @@ work is the same; only its order differs.
 The asyncio process is not thread-free. The SDK runs its one-time platform
 detection through `asyncio.to_thread`, which starts one default-executor thread,
 and against a hostname (the live API) `getaddrinfo` runs on that executor too.
-Thread stacks are mostly virtual (8 MiB reserved, a few pages touched), which
-is why 1024 threads cost tens of MB of RSS rather than 8 GiB.
+Thread stacks are mostly virtual (16 MiB reserved each here, the `ulimit -s`
+of this shell, with only a few pages touched), which is why 1024 threads cost
+tens of MB of RSS rather than 16 GiB.
 
 ## Cancellation
 
@@ -203,16 +206,16 @@ about 10 s. Every request's client overhead is milliseconds, so:
   are billed) whether or not anyone waits. And the interpreter will not exit
   until they finish or time out. With the classifier's client at this branch's
   base (42e6468: `max_retries=4`, the SDK's default 600 s timeout), that could
-  take minutes on a hung connection. `main` has since turned SDK retries off,
-  set a 240 s read timeout, and added a 560 s watchdog that saves finished
-  results and exits with `os._exit`. A two-stage Ctrl-C (the first waits for
+  take minutes on a hung connection. A two-stage Ctrl-C (the first waits for
   in-flight requests and stores what was paid for, the second calls
-  `os._exit`), which `main` also has now, is the right shape for threads. With
-  asyncio, the "wait for what is already paid
-  for" policy would still apply to the first Ctrl-C, since cancelling does not
-  un-bill a request. But the second stage could cancel and close cleanly, so
-  `finally` blocks and the SQLite commit path run, instead of `os._exit`
-  skipping them. A deadline (`asyncio.timeout`) would also become a one-liner.
+  `os._exit`) is the best a threaded engine can do. With asyncio, the "wait for
+  what is already paid for" policy would still apply to the first Ctrl-C, since
+  cancelling does not un-bill a request. But the second stage could cancel and
+  close cleanly, so `finally` blocks and the SQLite commit path run, and a
+  deadline (`asyncio.timeout`) becomes a one-liner. For these reasons, not for
+  speed, `main` is moving to an asyncio engine as the classifier's default,
+  keeping the threaded engine as a reference under
+  `src/asio_doc_tools/classify/threaded_reference/`.
 - **At hundreds in flight, the SDK's default transport is the bottleneck in
   either model** (~55-130 req/s on this laptop); the aiohttp transport would be
   the thing to evaluate then.

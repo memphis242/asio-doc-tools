@@ -4,13 +4,16 @@ A benchmark comparing two ways to keep many Claude API requests in flight from P
 
 - **threads**: the sync `anthropic.Anthropic` client shared by a
   `concurrent.futures.ThreadPoolExecutor(max_workers=C)`. This is what
-  `asio_doc_tools.classify` does today (8 workers).
+  the classifier's threaded engine does (8 workers).
 - **asyncio**: `anthropic.AsyncAnthropic` shared by N tasks in an `asyncio.TaskGroup`,
   with at most C of them past an `asyncio.Semaphore(C)` at a time.
 
 It measures how the two differ across concurrency levels, request sizes, and
 cancellation, and whether the live API's rate limits show up at these loads.
 The numbers for one machine, and what they mean, are in [RESULTS.md](RESULTS.md).
+Why blocking threads kept pace with the event loop up to a point, and why the
+event loop pulled ahead past it, is explained in
+[THREADS-VS-EVENT-LOOP.md](THREADS-VS-EVENT-LOOP.md).
 
 Nothing here touches the project's classification store: the live classification
 scenario sends the project's real request shape and throws the answers away.
